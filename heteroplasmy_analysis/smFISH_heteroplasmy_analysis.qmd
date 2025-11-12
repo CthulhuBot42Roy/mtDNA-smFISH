@@ -1,0 +1,2862 @@
+---
+title: "smFISH Heteroplasmy Analysis"
+author: "Abhilesh Dhawanjewar"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+bibliography: smFISH_heteroplasmy_analysis_refs.bib
+csl: cell.csl
+format:
+    html:
+        code-fold: true
+        embed-resources: true
+        df-print: kable
+execute:
+    echo: false
+    warning: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+knitr::opts_chunk$set(
+    echo = FALSE,
+    message = FALSE,
+    warning = FALSE,
+    # out.width = "100%",
+    fig.align = "center"
+)
+
+# Manage conflicts
+library(conflicted)
+
+# Set preference for conflicts
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(stats::update)
+
+# Data processing libraries
+library(here)
+library(readxl)
+library(janitor)
+library(tidyverse)
+# Data visualization libraries
+library(ggsci)
+library(ggsignif)
+library(ggridges)
+library(RColorBrewer)
+# Statistical testing libraries
+library(car)
+library(lattice)
+library(nlme)
+# ABC analysis
+library(EasyABC)
+library(abcrf)
+library(moments)
+# Reporting libraries
+library(kableExtra)
+
+# Set the seed for reproducibility
+set.seed(26051992)
+```
+
+Each NSC gives rise to 6 progeny cells and the progeny cells have less mutant mtDNA than the NSCs they derive from. There is extensive progeny cell-to-progeny cell variability in heteroplasmy levels, even for those progeny cells derived from the same NSC.
+
+```{r}
+#| label: load-data
+#| echo: true
+#| code-summary: "Load and preprocess data"
+
+data_dir <- here("data")
+plot_dir <- here("figures")
+
+if (!dir.exists(plot_dir)) {
+    dir.create(plot_dir, recursive = TRUE)
+}
+
+# Load excel data
+cell_volume_data <- read_excel(
+    here(data_dir, "NSC-progeny cell volume.xlsx")
+)
+mtDNA_number_data <- read_excel(
+    here(data_dir, "NSC-progeny FISH mtDNA number.xlsx")
+)
+
+# Clean column names
+cell_volume_data <- cell_volume_data %>% clean_names()
+mtDNA_number_data <- mtDNA_number_data %>% clean_names()
+
+cell_volume_data <- cell_volume_data %>% rename("cell_type" = "x1")
+# Rename columns using janitor
+mtDNA_number_data <- mtDNA_number_data %>%
+    rename_with(~ gsub("mt_dna_", "mtDNA_", .), starts_with("mt_dna"))
+
+# Colours for plots
+NSC_color <- "#7384E9"
+progeny_color <- "#97DDEC"
+sim_color <- "#E64B35B2"
+
+# Labels for lineages in plots
+lineage_labels <- setNames(
+    paste("Lineage", sort(unique(mtDNA_number_data$lineage))),
+    sort(unique(mtDNA_number_data$lineage))
+)
+
+# Calculate heteroplasmy for each observation
+mtDNA_number_data <- mtDNA_number_data %>%
+    mutate(heteroplasmy = (mtDNA_mut / mtDNA_total) * 100)
+```
+
+
+### Observed volumes and mtDNA copy number
+There is an approximate reduction of 12-14x in cellular volume from NSCs to progeny cells.
+
+```{r}
+#| label: fig-plot-volume
+#| fig-cap: "Cellular, cytoplasmic, and nuclear volumes in NSCs and progeny cells. Boxplots show median, interquartile range, and individual data points. NSCs exhibit approximately 12-14× larger volumes than progeny cells across all compartments (Wilcoxon rank-sum test, p < 0.001 for all comparisons)."
+
+# Reshape data to long format
+cell_volume_long <- cell_volume_data %>%
+    pivot_longer(
+        cols = c(vol_cell, vol_nucleus, vol_cytopl),
+        names_to = "volume_type",
+        values_to = "volume"
+    )
+
+# Create side-by-side boxplots
+p_cell_volume <- ggplot(
+    cell_volume_long, aes(x = volume_type, y = volume, fill = cell_type)
+) +
+    geom_boxplot(position = position_dodge(width = 0.75)) +
+    labs(
+        y = expression("Volume (" * mu * "m"^3 * ")"),
+        fill = "Cell Type"
+    ) +
+    theme_minimal() +
+    scale_x_discrete(labels = c(
+        "vol_cell" = "Cellular volume",
+        "vol_cytopl" = "Cytoplasmic volume",
+        "vol_nucleus" = "Nuclear volume"
+    )) +
+    scale_fill_manual(values = c(
+        NSC = NSC_color,
+        Progeny = progeny_color
+    )) +
+    theme(axis.title.x = element_blank())
+
+ggsave(here(plot_dir, "cell_volume_comparison_NSC_vs_progeny.png"), p_cell_volume, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "cell_volume_comparison_NSC_vs_progeny.pdf"), p_cell_volume, width = 8, height = 6)
+
+p_cell_volume
+```
+
+```{r}
+#| label: fig-plot-mtDNA-number
+#| fig-cap: "mtDNA copy number in NSCs and progeny cells. Each dot represents a single cell, colored by lineage. NSCs contain significantly more mtDNA molecules than progeny cells (Wilcoxon rank-sum test, p < 0.001), with approximately 12× reduction consistent with cellular volume changes."
+
+mtDNA_number_data$cell_type <- factor(
+    mtDNA_number_data$cell_type,
+    levels = c("NSC", "Progeny")
+)
+
+# Wilcoxon rank-sum test for mtDNA copy number
+mtDNA_wilcox <- wilcox.test(mtDNA_total ~ cell_type, data = mtDNA_number_data)
+mtDNA_p_value <- format(mtDNA_wilcox$p.value, scientific = TRUE, digits = 2)
+
+# Format p-value label
+if (mtDNA_wilcox$p.value < 0.001) {
+    p_label <- "p < 0.001"
+} else {
+    p_label <- paste0("p = ", mtDNA_p_value)
+}
+
+p_mtDNA_copy_number <- ggplot(
+    mtDNA_number_data, aes(x = cell_type, y = mtDNA_total)
+) +
+    geom_boxplot(
+        width = 0.15,
+        position = position_dodge(width = 5),
+        outlier.shape = NA
+    ) +
+    geom_jitter(
+        aes(fill = factor(lineage)),
+        position = position_jitter(width = 0.1),
+        size = 2,
+        alpha = 0.7,
+        shape = 21,
+        color = "black"
+    ) +
+    labs(
+        x = "Cell Type",
+        y = "mtDNA copy number",
+        fill = "Lineage"
+    ) +
+    scale_fill_manual(
+        values = setNames(
+            colorRampPalette(
+                brewer.pal(8, "Dark2")
+            )(length(unique(mtDNA_number_data$lineage))),
+            sort(unique(mtDNA_number_data$lineage))
+            )
+    ) +
+    geom_signif(
+        comparisons = list(c("NSC", "Progeny")),
+        annotations = p_label,
+        y_position = max(mtDNA_number_data$mtDNA_total) * 1.05,
+        tip_length = 0.02,
+        textsize = 4,
+        vjust = -0.5
+    ) +
+    theme_minimal() +
+    theme(
+        legend.position = "right"
+    )
+
+
+ggsave(here(plot_dir, "mtDNA_copy_number_NSC_vs_progeny.png"), p_mtDNA_copy_number, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "mtDNA_copy_number_NSC_vs_progeny.pdf"), p_mtDNA_copy_number, width = 8, height = 6)
+
+p_mtDNA_copy_number
+```
+
+The mtDNA copy number was significantly lower in progeny cells compared to NSCs (Wilcoxon rank-sum test, p = `r mtDNA_p_value`).
+
+```{r}
+#| label: volume-and-mtDNA-reduction
+
+# Calculate mean volumes for each cell type and volume type
+mean_volumes <- cell_volume_long %>%
+    group_by(cell_type, volume_type) %>%
+    summarize(mean_volume = mean(volume, na.rm = TRUE), .groups = "drop")
+
+# Calculate the reduction in volume for each type
+volume_reduction <- mean_volumes %>%
+    spread(cell_type, mean_volume) %>%
+    mutate(reduction = NSC - Progeny)
+
+# Calculate reduction ratios
+reduction_summary <- mtDNA_number_data %>%
+    group_by(cell_type) %>%
+    summarize(
+        mean_mtDNA = mean(mtDNA_total, na.rm = TRUE),
+        sd_mtDNA = sd(mtDNA_total, na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    pivot_wider(
+        names_from = cell_type,
+        values_from = c(mean_mtDNA, sd_mtDNA)
+    ) %>%
+    mutate(
+        mtDNA_reduction = mean_mtDNA_NSC / mean_mtDNA_Progeny
+    )
+
+volume_reduction_summary <- cell_volume_data %>%
+    group_by(cell_type) %>%
+    summarize(
+        mean_vol = mean(vol_cell, na.rm = TRUE),
+        sd_vol = sd(vol_cell, na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    pivot_wider(
+        names_from = cell_type,
+        values_from = c(mean_vol, sd_vol)
+    ) %>%
+    mutate(
+        volume_reduction = mean_vol_NSC / mean_vol_Progeny
+    )
+
+# Combine into summary table
+reduction_table <- data.frame(
+    Measure = c("mtDNA Copy Number", "Cellular Volume (μm³)"),
+    NSC_Mean = c(
+        sprintf("%.1f ± %.1f", reduction_summary$mean_mtDNA_NSC, reduction_summary$sd_mtDNA_NSC),
+        sprintf("%.1f ± %.1f", volume_reduction_summary$mean_vol_NSC, volume_reduction_summary$sd_vol_NSC)
+    ),
+    Progeny_Mean = c(
+        sprintf("%.1f ± %.1f", reduction_summary$mean_mtDNA_Progeny, reduction_summary$sd_mtDNA_Progeny),
+        sprintf("%.1f ± %.1f", volume_reduction_summary$mean_vol_Progeny, volume_reduction_summary$sd_vol_Progeny)
+    ),
+    Fold_Reduction = c(
+        sprintf("%.1f×", reduction_summary$mtDNA_reduction),
+        sprintf("%.1f×", volume_reduction_summary$volume_reduction)
+    )
+)
+
+reduction_table %>%
+    kable(
+        col.names = c("", "NSC (Mean ± SD)", "Progeny (Mean ± SD)", "Fold Reduction"),
+        align = c("l", "r", "r", "r"),
+        caption = "Comparison of mtDNA copy number and cellular volume between NSCs and progeny cells"
+    ) %>%
+    kable_styling(
+        bootstrap_options = c("striped", "hover"),
+        full_width = FALSE
+    )
+```
+
+There is an approximate 12-14x reduction in mtDNA copy number from NSCs to progeny cells, similar to the reduction in cellular volume.
+
+### Observed heteroplasmy levels
+
+The variance in the heteroplasmy levels for progeny cells is higher compared to NSCs. The average heteroplasmy levels are lower in progeny cells compared to NSCs.
+
+```{r}
+#| label: fig-observed-heteroplasmy-boxplots
+#| fig-cap: "Heteroplasmy levels in NSCs and individual progeny cells for each of 14 lineages. Each NSC (left) gives rise to ~6 progeny cells (right). Progeny cells show increased variance and generally lower heteroplasmy compared to their parent NSC, with substantial cell-to-cell variability even among progeny from the same NSC."
+
+# Extract observed heteroplasmy for progeny cells
+observed_heteroplasmy_progeny <- mtDNA_number_data %>%
+    dplyr::filter(cell_type == "Progeny") %>%
+    dplyr::select(lineage, heteroplasmy) %>%
+    dplyr::mutate(cell_type = "Progeny")
+
+# Extract observed heteroplasmy for NSCs
+observed_heteroplasmy_NSCs <- mtDNA_number_data %>%
+    dplyr::filter(cell_type == "NSC") %>%
+    dplyr::select(lineage, heteroplasmy) %>%
+    dplyr::mutate(cell_type = "NSC")
+
+# Combine the data for progeny cells and NSCs
+combined_heteroplasmy_data <- bind_rows(
+    observed_heteroplasmy_progeny %>% mutate(cell_type_lineage = paste("Progeny", lineage)),
+    observed_heteroplasmy_NSCs %>% mutate(cell_type_lineage = "NSC")
+)
+
+# Convert cell_type_lineage to a factor and specify the levels in the desired order
+combined_heteroplasmy_data$cell_type_lineage <- factor(
+    combined_heteroplasmy_data$cell_type_lineage,
+    levels = c("NSC", paste("Progeny", sort(unique(observed_heteroplasmy_progeny$lineage))))
+)
+
+# Create custom x-axis labels
+x_labels <- c("NSC", paste("Lineage", sort(unique(observed_heteroplasmy_progeny$lineage))))
+
+# Create side-by-side boxplots
+p_obs_heteroplasmy_boxplot <- ggplot(
+    combined_heteroplasmy_data, aes(x = cell_type_lineage, y = heteroplasmy, fill = cell_type)
+) +
+    geom_boxplot(width = 0.5, alpha = 0.7) +
+    geom_point(
+        aes(fill = cell_type),
+        shape = 21,
+        color = "black",
+        size = 3,
+        alpha = 0.7
+    ) +
+    labs(
+        x = "Cell Type and Lineage",
+        y = "Heteroplasmy (%)",
+        fill = "Cell Type"
+    ) +
+    ylim(0, 100) +
+    theme_minimal() +
+    scale_fill_manual(
+        values = c("NSC" = "#7384E9", "Progeny" = "#97DDEC"),
+        labels = c("NSC" = "NSC", "Progeny" = "Progeny")
+    ) +
+    scale_x_discrete(labels = x_labels) +
+    theme(
+        legend.position = "bottom",
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1),
+    )
+
+# Wilcoxon rank-sum test for heteroplasmy
+het_wilcox <- wilcox.test(heteroplasmy ~ cell_type, data = mtDNA_number_data)
+het_p_value <- format(het_wilcox$p.value, scientific = TRUE, digits = 2)
+
+ggsave(here(plot_dir, "heteroplasmy_boxplot_per_lineage.png"), p_obs_heteroplasmy_boxplot, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "heteroplasmy_boxplot_per_lineage.pdf"), p_obs_heteroplasmy_boxplot, width = 8, height = 6)
+
+p_obs_heteroplasmy_boxplot
+```
+
+```{r}
+#| label: heteroplasmy-comparison-table
+
+# Calculate heteroplasmy summary statistics
+heteroplasmy_summary <- mtDNA_number_data %>%
+    group_by(cell_type) %>%
+    summarize(
+        mean_het = mean(heteroplasmy, na.rm = TRUE),
+        sd_het = sd(heteroplasmy, na.rm = TRUE),
+        median_het = median(heteroplasmy, na.rm = TRUE),
+        iqr_het = IQR(heteroplasmy, na.rm = TRUE),
+        .groups = "drop"
+    )
+
+# Calculate fold change
+nsc_mean <- heteroplasmy_summary %>% filter(cell_type == "NSC") %>% pull(mean_het)
+prog_mean <- heteroplasmy_summary %>% filter(cell_type == "Progeny") %>% pull(mean_het)
+fold_change <- nsc_mean / prog_mean
+
+# Create comparison table
+heteroplasmy_table <- data.frame(
+    Measure = c("Heteroplasmy (%)"),
+    NSC_Mean = sprintf("%.1f ± %.1f",
+        heteroplasmy_summary$mean_het[heteroplasmy_summary$cell_type == "NSC"],
+        heteroplasmy_summary$sd_het[heteroplasmy_summary$cell_type == "NSC"]),
+    NSC_Median = sprintf("%.1f (IQR: %.1f)",
+        heteroplasmy_summary$median_het[heteroplasmy_summary$cell_type == "NSC"],
+        heteroplasmy_summary$iqr_het[heteroplasmy_summary$cell_type == "NSC"]),
+    Progeny_Mean = sprintf("%.1f ± %.1f",
+        heteroplasmy_summary$mean_het[heteroplasmy_summary$cell_type == "Progeny"],
+        heteroplasmy_summary$sd_het[heteroplasmy_summary$cell_type == "Progeny"]),
+    Progeny_Median = sprintf("%.1f (IQR: %.1f)",
+        heteroplasmy_summary$median_het[heteroplasmy_summary$cell_type == "Progeny"],
+        heteroplasmy_summary$iqr_het[heteroplasmy_summary$cell_type == "Progeny"]),
+    Fold_Change = sprintf("%.2f×", fold_change),
+    P_Value = format(het_wilcox$p.value, scientific = TRUE, digits = 2)
+)
+
+knitr::kable(
+    heteroplasmy_table,
+    col.names = c(
+        "", "NSC (Mean ± SD)", "NSC (Median, IQR)",
+        "Progeny (Mean ± SD)", "Progeny (Median, IQR)",
+        "Fold Change", "P-value"),
+    align = c("l", "r", "r", "r", "r", "r", "r"),
+    caption = "Comparison of heteroplasmy levels between NSCs and progeny cells"
+) %>%
+    kable_styling(
+        bootstrap_options = c("striped", "hover"),
+        full_width = FALSE
+    )
+```
+
+The mean heteroplasmy level was significantly lower in progeny cells compared to NSCs (Wilcoxon rank-sum test, p = `r het_p_value`).
+
+Plotting the heteroplasmy levels for all NSCs and progeny cells across all lineages.
+
+```{r}
+#| label: fig-observed-heteroplasmy
+#| fig.cap: "Heteroplasmy levels in NSCs and progeny cells across all lineages"
+
+# Create boxplots with data points
+p_obs_heteroplasmy <- ggplot(
+    mtDNA_number_data, aes(x = cell_type, y = heteroplasmy)
+) +
+    geom_boxplot(
+        width = 0.15,
+        position = position_dodge(width = 5),
+        outlier.shape = NA
+    ) +
+    geom_jitter(
+        aes(fill = factor(lineage)),
+        position = position_jitter(width = 0.1),
+        size = 2,
+        alpha = 0.7,
+        shape = 21,
+        color = "black"
+    ) +
+    labs(
+        x = "Cell Type",
+        y = "Heteroplasmy (%)",
+        fill = "Lineage"
+    ) +
+    ylim(0, 100) +
+    scale_fill_manual(
+        values = setNames(
+            colorRampPalette(
+                brewer.pal(8, "Dark2")
+            )(length(unique(mtDNA_number_data$lineage))),
+            sort(unique(mtDNA_number_data$lineage))
+        )
+    ) +
+    theme_minimal() +
+    theme(
+        legend.position = "right",
+    )
+
+ggsave(here(plot_dir, "heteroplasmy_NSC_vs_progeny_all_lineages.png"), p_obs_heteroplasmy, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "heteroplasmy_NSC_vs_progeny_all_lineages.pdf"), p_obs_heteroplasmy, width = 8, height = 6)
+
+p_obs_heteroplasmy
+```
+
+Plotting the observed heteroplasmy in NSCs and progeny cells by Lineage
+
+```{r}
+#| label: fig-observed-heteroplasmy-lineage
+#| fig-cap: "Heteroplasmy distributions in NSCs and progeny cells faceted by lineage. Each panel shows one NSC (left) and its ~6 progeny cells (right). Points are colored by lineage. The shift toward lower heteroplasmy and increased variance in progeny is evident across all lineages, though the magnitude varies"
+#| fig.asp: 1.2
+
+# Create boxplots with data points, faceted by lineage
+p_obs_lineage_heteroplasmy <- ggplot(
+    mtDNA_number_data, aes(x = cell_type, y = heteroplasmy)
+) +
+    geom_boxplot(outlier.shape = NA, width = 0.3) +
+    geom_jitter(
+        aes(fill = factor(lineage)),
+        position = position_jitter(width = 0.15),
+        size = 2,
+        alpha = 0.7,
+        shape = 21,
+        color = "black"
+    ) +
+    labs(
+        x = "Cell Type",
+        y = "Heteroplasmy (%)",
+        fill = "Lineage"
+    ) +
+    scale_fill_manual(
+        values = setNames(
+            colorRampPalette(brewer.pal(8, "Dark2"))(length(unique(mtDNA_number_data$lineage))),
+            sort(unique(mtDNA_number_data$lineage))
+        )
+    ) +
+    facet_wrap(
+        ~lineage,
+        scales = "free_y",
+        labeller = labeller(lineage = lineage_labels)
+    ) +
+    guides(fill = guide_legend(nrow = 1)) +
+    ylim(0, 100) +
+    theme_minimal() +
+    theme(
+        legend.position = "bottom",
+    )
+
+ggsave(here(plot_dir, "heteroplasmy_distributions_by_lineage.png"), p_obs_lineage_heteroplasmy, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "heteroplasmy_distributions_by_lineage.pdf"), p_obs_lineage_heteroplasmy, width = 8, height = 6)
+
+p_obs_lineage_heteroplasmy
+```
+
+
+### Mixed-effects models for heteroplasmy variances
+
+To test whether the heteroplasmy variances differ between NSCs and progeny cells, we used linear mixed-effects models [@pinheiro2000] with cell type as a fixed effect and lineage as a random effect. We compared a null model assuming equal variances (Model 0) to an alternative model allowing for different variances in the two cell types (Model 1) using a likelihood ratio test. For indices $i$ representing cell lineage, $j$ representing individual observations, $k$ representing cell type (NSC or Progeny) of observation $j$ and heteroplasmy $h_{ij}$, the models are defined as follows:
+
+- **Model 0 (null model): Equal variances**
+  $$logit(h_{ij}) = \beta_{0} + \beta_{1} \cdot \text{(cell type)}_{k} + u_{i} + \epsilon_{ij}$$
+
+  where:
+    - $u_i \sim N(0, \sigma_{u}^{2})$   $\to$ random intercept for lineage $i$
+    - $\epsilon_{ij} \sim N(0, \sigma^{2})$  $\to$ residual error with equal variance across cell types
+
+- **Model 1 (alternative model): Unequal variances**
+  $$logit(h_{ij}) = \beta_{0} + \beta_{1} \cdot \text{(cell type)}_{k} + u_{i} + \epsilon_{ij}$$
+
+  where:
+  - $u_i \sim N(0, \sigma_{u}^{2})$  $\to$ random intercept for lineage $i$
+  - $\epsilon_{ij} \sim N(0, \sigma_{k}^{2})$  $\to$ residual error with variance $\sigma_{k}^{2}$ specific to cell type $k$
+
+Raw heteroplasmy data was logit transformed and squeezed to avoid issues with 0 and 100% values before fitting the models. The $\delta$ value was set to $\frac{1}{2N_{max}}$, where $N_{max}$ is the largest observed mtDNA copy number, to avoid issues with zero or one heteroplasmy values while minimizing bias.
+$$logit(h) = ln (\frac{h}{1-h})$$
+
+Models were fit with Maximum Likelihood (ML) for the likelihood ratio test and with Restricted Maximum Likelihood (REML) for parameter estimation.
+
+```{r}
+#| label: mixed-effects-modeling-het-var
+#| echo: true
+#| code-summary: "Linear mixed-effects modeling of heteroplasmy variances"
+
+# Logit transform heteroplasmy to fit normality assumptions
+mtDNA_logit_data <- mtDNA_number_data %>%
+    dplyr::mutate(
+        heteroplasmy_prop = heteroplasmy / 100,
+        # Calculate epsilon based on the largest observed mtDNA pool in the data
+        epsilon = 1 / (2 * max(mtDNA_total, na.rm = TRUE)),
+        heteroplasmy_prop_squeezed = pmax(epsilon, pmin(1 - epsilon, heteroplasmy_prop)),
+        logit_heteroplasmy = car::logit(heteroplasmy_prop_squeezed)
+    )
+
+# Model 0 (null model): Equal variances
+lme_null_model <- lme(
+    logit_heteroplasmy ~ cell_type,
+    random = ~ 1 | lineage,
+    data = mtDNA_logit_data,
+    method = "ML"
+)
+
+# Model 1 (alternative model): Unequal variances
+lme_alt_model <- lme(
+    logit_heteroplasmy ~ cell_type,
+    random = ~ 1 | lineage,
+    weights = varIdent(form = ~ 1 | cell_type),
+    data = mtDNA_logit_data,
+    method = "ML"
+)
+
+# Likelihood ratio test
+lrt_result <- anova(
+    lme_alt_model,
+    lme_null_model
+)
+
+lrt_l_ratio <- round(lrt_result$L.Ratio[2], 2)
+lrt_p_value <- format(
+    lrt_result$`p-value`[2], scientific = FALSE, digits = 4
+)
+
+# Summary of the best-fit model
+lme_alt_summary <- summary(
+    update(lme_alt_model, method = "REML")
+)
+
+# Extract coefficients and p-values
+tTable <- lme_alt_summary$tTable
+
+beta_progeny <- tTable[
+    "cell_typeProgeny", "Value"
+    ]
+se_progeny <- tTable[
+    "cell_typeProgeny", "Std.Error"
+    ]
+p_progeny <- tTable[
+    "cell_typeProgeny", "p-value"
+    ]
+```
+
+```{r}
+#| label: fig-mixed-effects-model-residuals
+#| fig.cap: "Diagnostic plots for the linear mixed-effects model on logit-transformed heteroplasmy"
+
+# Diagnostic plots for the best-fit model
+residuals_alt_model <- residuals(
+    lme_alt_model,
+    type = "pearson"
+)
+fitted_alt_model <- fitted(lme_alt_model)
+
+p_residuals_alt <- ggplot(
+    data = data.frame(
+        Fitted = fitted_alt_model,
+        Residuals = residuals_alt_model
+    ),
+    aes(x = Fitted, y = Residuals)
+) +
+    geom_point() +
+    geom_hline(
+        yintercept = 0,
+        linetype = "dashed",
+        color = "red"
+    ) +
+    labs(
+        x = "Fitted Values",
+        y = "Residuals"
+    ) +
+    theme_minimal()
+
+ggsave(here(plot_dir, "lme_residuals_diagnostic.png"), p_residuals_alt, width = 6, height = 6, dpi = 300)
+ggsave(here(plot_dir, "lme_residuals_diagnostic.pdf"), p_residuals_alt, width = 6, height = 6)
+
+p_residuals_alt
+```
+
+```{r}
+#| label: fig-mixed-effects-model-qqplot
+#| fig.cap: "Q-Q plot of residuals for the linear mixed-effects model on logit-transformed heteroplasmy"
+
+# Extract standardized residuals
+qq_data <- data.frame(
+    sample = sort(residuals_alt_model),
+    theoretical = qnorm(ppoints(length(residuals_alt_model)))
+)
+
+p_qq_alt <- ggplot(qq_data, aes(sample = sample)) +
+    stat_qq(color = "#2E4BC6", size = 2, alpha = 0.6) +
+    stat_qq_line(color = "red", linetype = "dashed", linewidth = 1) +
+    labs(
+        x = "Theoretical Quantiles",
+        y = "Sample Quantiles",
+        title = "Q-Q Plot of Residuals"
+    ) +
+    theme_minimal() +
+    theme(
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.text = element_text(size = 10),
+        axis.title = element_text(size = 11, face = "bold")
+    )
+
+ggsave(here(plot_dir, "lme_qqplot_diagnostic.png"), p_qq_alt, width = 6, height = 6, dpi = 300)
+ggsave(here(plot_dir, "lme_qqplot_diagnostic.pdf"), p_qq_alt, width = 6, height = 6)
+
+p_qq_alt
+```
+
+The residuals vs. fitted values plot shows no systematic pattern, indicating that the model assumptions of constant variance and linearity are met. The Q-Q plot demonstrates that the residuals are approximately normally distributed, supporting the validity of the linear mixed-effects model.
+
+```{r}
+#| label: mixed-effects-model-mtDNA-CN-effect
+
+# Best-fit model from above
+# Model 1: Unequal variances
+lme_alt_model <- lme(
+    logit_heteroplasmy ~ cell_type,
+    random = ~ 1 | lineage,
+    weights = varIdent(form = ~ 1 | cell_type),
+    data = mtDNA_logit_data,
+    method = "ML"
+)
+
+# Model 2: Unequal variances + mtDNA copy number as covariate
+lme_alt_model_mtDNA <- lme(
+    logit_heteroplasmy ~ cell_type + mtDNA_total,
+    random = ~ 1 | lineage,
+    weights = varIdent(form = ~ 1 | cell_type),
+    data = mtDNA_logit_data,
+    method = "ML"
+)
+
+anova_result <- anova(lme_alt_model, lme_alt_model_mtDNA)
+mtDNA_lrt_p <- format(anova_result$`p-value`[2], scientific = FALSE, digits = 4)
+```
+
+Including mtDNA copy number as a covariate did not significantly improve the model fit (LRT p = `r mtDNA_lrt_p`), suggesting that the observed heteroplasmy differences are not driven by differences in mtDNA copy number.
+
+```{r}
+#| label: fig-heteroplasmy-variance-plot
+#| fig.asp: 1.1
+#| out.width: "60%"
+#| fig-cap: "Heteroplasmy variance in NSCs and progeny cells. Violin plots show kernel density estimates, with boxplots (median and IQR) and individual data points overlaid. Progeny cells exhibit significantly greater heteroplasmy variance than NSCs (LRT p < 0.001 for unequal variance model), despite having lower mean heteroplasmy. Each point represents a single cell"
+
+p_value_label <- paste(
+    "LRT p =",
+    format(
+        lrt_result$`p-value`[2],
+        scientific = FALSE,
+        digits = 1
+))
+
+p_het_variance <- ggplot(
+    mtDNA_number_data,
+    aes(
+        x = cell_type,
+        y = heteroplasmy,
+        fill = cell_type
+    )) +
+    geom_violin(width = 1.2, alpha = 0.4, color = NA) +
+    geom_boxplot(width = 0.2, alpha = 0.5, outlier.shape = NA) +
+    geom_jitter(
+        width = 0.14,
+        shape = 21,
+        stroke = 1,
+        size = 4,
+        alpha = 0.6,
+        color = "black"
+    ) +
+    geom_signif(
+        comparisons = list(c("NSC", "Progeny")),
+        annotations = p_value_label,
+        y_position = 80,
+        tip_length = 0.03,
+        textsize = 5,
+        vjust = -0.5
+    ) +
+    scale_x_discrete(
+        labels = c(
+            "NSC" = "NSC", "Progeny" = "Progeny"
+        )
+    ) +
+    scale_fill_manual(
+        values = c(
+            "NSC" = NSC_color, "Progeny" = progeny_color
+        ),
+        labels = c("NSC" = "NSC", "Progeny" = "Progeny")
+    ) +
+    labs(
+        x = "Cell Type",
+        y = "Heteroplasmy (%)",
+        fill = "Cell Type"
+    ) +
+    theme_minimal() +
+    theme(
+        legend.position = "bottom"
+    )
+
+
+ggsave(here(plot_dir, "heteroplasmy_variance_NSC_vs_progeny.png"), p_het_variance, width = 6, height = 8, dpi = 300)
+ggsave(here(plot_dir, "heteroplasmy_variance_NSC_vs_progeny.pdf"), p_het_variance, width = 6, height = 8)
+
+p_het_variance
+```
+
+The linear mixed-effects model on the logit-transformed heteroplasmy data revealed that the odds ratio for progeny cells vs NSC was 0.47 ($\beta$ = `r round(beta_progeny, 3)`, SE = `r round(se_progeny, 3)`, p < 0.001), indicating that progeny cells had 53% lower odds of carrying mutant mtDNA compared to NSCs. Progeny cells also showed significantly greater heteroplasmy variability than NSCs, as determined by a likelihood ratio test (LRT) comparing the model allowing for different variances to a null model assuming equal variances (LRT = `r lrt_l_ratio`, p = `r lrt_p_value`).
+
+
+### Simulations of mtDNA segregation from NSCs to progeny cells
+
+To test whether the observed heteroplasmy variance and shifts in progeny cells could arise purely from stochastic mtDNA partitioning, we simulated heteroplasmy under a model of random drift.
+
+The simulation strategy was as follows:
+
+1. Simulations were performed independently for each observed cell lineage.
+2. For each lineage, a virtual parent NSC was created containing the same number of wild-type and mutant mtDNA molecules as observed experimentally.
+3. For each progeny cell, a corresponding total mtDNA copy number was assigned based on the experimentally observed values.
+4. A simulated sample of mtDNA molecules was drawn from the parent pool using hypergeometric sampling, modeling partitioning without replacement so that molecules assigned to one progeny cell were removed from the pool and unavailable for subsequent draws.
+5. The heteroplasmy level for each simulated progeny cell was then calculated as the ratio of mutant molecules to the sampled mtDNA total.
+6. The simulation of the entire lineage was repeated 10,000 times to generate a null distribution of heteroplasmy levels for each progeny cell.
+
+```{r}
+#| label: simulate-lineage-hypergeometric
+#| echo: true
+#| code-summary: "Simulation functions for modeling random drift"
+
+simulate_lineage_hypergeometric <- function(
+    nsc_wt, nsc_mut, observed_totals, n_draws = 999) {
+    n_progeny <- length(observed_totals)
+
+    simulated_draws <- replicate(n_draws,
+        {
+            # Initialize the pool for this single simulation run
+            remaining_wt <- nsc_wt
+            remaining_mut <- nsc_mut
+
+            # Create empty vectors to store the results for each progeny cell
+            wt_samples <- numeric(n_progeny)
+            mut_samples <- numeric(n_progeny)
+
+            # Loop through each progeny cell, drawing from and then shrinking the pool
+            for (i in seq_len(n_progeny)) {
+                # The total mtDNA available for this draw
+                current_total_pool <- remaining_wt + remaining_mut
+
+                # If the current pool is empty, we cannot draw any mtDNA
+                if (current_total_pool == 0) {
+                    wt_samples[i] <- 0
+                    mut_samples[i] <- 0
+                    next
+                }
+
+                # The number of molecules to sample for this progeny cell
+                k_draw <- min(observed_totals[i], current_total_pool)
+
+                # Hypergeometric draw without replacement from the current pool
+                wt_samples[i] <- rhyper(1,
+                    m = remaining_wt, # Number of wild-type mtDNA available
+                    n = remaining_mut, # Number of mutant mtDNA available
+                    k = k_draw # Number of molecules to sample
+                )
+
+                # Calculate the number of mutant mtDNA drawn
+                mut_samples[i] <- k_draw - wt_samples[i]
+
+                # Update the remaining pools for the next draw
+                remaining_wt <- remaining_wt - wt_samples[i]
+                remaining_mut <- remaining_mut - mut_samples[i]
+            }
+
+            # Calculate heteroplasmy for each progeny cell in this draw
+            heteroplasmy_values <- (mut_samples / observed_totals) * 100
+            #  Handle cases where observed totals in 0 to avoid Nan
+            heteroplasmy_values[is.nan(heteroplasmy_values)] <- 0
+
+            # Return a data frame with simulated values for this single draw
+            data.frame(
+                mtDNA_total = observed_totals,
+                mtDNA_wt = wt_samples,
+                mtDNA_mut = mut_samples,
+                heteroplasmy = heteroplasmy_values
+            )
+        },
+        simplify = FALSE
+    )
+    return(simulated_draws)
+}
+
+# Simulate mtDNA distribution in progeny cells for all lineages
+simulate_all_lineages <- function(mtDNA_data, n_draws = 999) {
+    # Split data by lineage
+    lineage_groups <- mtDNA_data %>%
+        dplyr::group_by(lineage) %>%
+        dplyr::group_split()
+
+    all_simulations <- list()
+
+    for (lineage_data in lineage_groups) {
+        # Extract NSC data for this lineage
+        nsc_data <- lineage_data %>%
+            filter(cell_type == "NSC")
+
+        # Extract progeny data for this lineage
+        progeny_data <- lineage_data %>%
+            filter(cell_type == "Progeny")
+
+        # Extract mtDNA_wt and mtDNA_mut for NSC
+        nsc_wt <- nsc_data$mtDNA_wt
+        nsc_mut <- nsc_data$mtDNA_mut
+
+        # Get observed mtDNA_total for progeny cells
+        observed_progeny_totals <- progeny_data$mtDNA_total
+
+        # Simulate mtDNA distribution in progeny cells for this lineage
+        lineage_simulations <- simulate_lineage_hypergeometric(
+            nsc_wt = nsc_wt,
+            nsc_mut = nsc_mut,
+            observed_totals = observed_progeny_totals,
+            n_draws = n_draws
+        )
+
+        # Store the simulations
+        all_simulations[[as.character(unique(nsc_data$lineage))]] <- lineage_simulations
+    }
+
+    return(all_simulations)
+}
+```
+
+```{r}
+#| label: simulate_progeny_cells
+#| cache: true
+
+n_sims <- 10000
+
+progeny_sims <- simulate_all_lineages(
+    mtDNA_data = mtDNA_number_data,
+    n_draws = n_sims
+)
+```
+
+We tested the convergence of the simulation results by running the simulations with different sample sizes (1,000; 5,000; 10,000; and 20,000) and comparing the resulting heteroplasmy distributions and summary statistics.
+
+```{r}
+#| label: test-simulations-convergence
+#| echo: true
+#| cache: true
+#| code-summary: "Test simulation convergence across different sample sizes"
+
+test_sim_convergence <- function() {
+
+    # Set of different n_sims to test
+    n_sim_values <- c(1000, 5000, 10000, 20000)
+
+    all_distributions <- list()
+    all_summaries <- list()
+
+    for (n in n_sim_values) {
+
+        sims <- simulate_all_lineages(
+            mtDNA_data = mtDNA_number_data,
+            n_draws = n
+        )
+
+        simulated_het_df <- purrr::imap_dfr(
+            sims,
+            ~ purrr::map_dfr(.x, ~.x, .id = "simulation_id"),
+            .id = "lineage"
+        )
+
+        all_distributions[[length(all_distributions) + 1]] <- simulated_het_df %>%
+            dplyr::select(heteroplasmy) %>%
+            mutate(n_sims = factor(
+                n,
+                levels = n_sim_values,
+                labels = paste0(format(n_sim_values, big.mark = ","), " sims")
+            ))
+
+        all_summaries[[length(all_summaries) + 1]] <- data.frame(
+            n_sims = n,
+            mean_het = mean(simulated_het_df$heteroplasmy, na.rm = TRUE),
+            sd_het = sd(simulated_het_df$heteroplasmy, na.rm = TRUE),
+            median_het = median(simulated_het_df$heteroplasmy, na.rm = TRUE),
+            var_het = var(simulated_het_df$heteroplasmy, na.rm = TRUE),
+            p25_het = quantile(simulated_het_df$heteroplasmy, 0.25, na.rm = TRUE),
+            p75_het = quantile(simulated_het_df$heteroplasmy, 0.75, na.rm = TRUE),
+            n_unique = n_distinct(simulated_het_df$heteroplasmy)
+        )
+    }
+
+    list(
+        distributions = do.call(rbind, all_distributions),
+        summaries = do.call(rbind, all_summaries)
+    )
+}
+
+convergence_results <- test_sim_convergence()
+
+convergence_dist_df <- convergence_results$distributions
+convergence_summary_df <- convergence_results$summaries
+```
+
+```{r}
+#| label: fig-simulation-convergence
+#| fig.cap: "Convergence of heteroplasmy distributions across different simulation sample sizes. Kernel density estimates of heteroplasmy levels from simulations with varying numbers of draws (1,000; 5,000; 10,000; and 20,000) are shown. The distributions overlap closely, indicating convergence of the simulation results as sample size increases."
+
+p_convergence_dist <- ggplot(convergence_dist_df,
+    aes(x = heteroplasmy, color = n_sims)) +
+    geom_density(linewidth = 1.2, bw = "nrd0") +
+    scale_color_manual(
+        name = "Sample Size",
+        values = c(
+            " 1,000 sims" = "gray60",
+            " 5,000 sims" = "coral",
+            "10,000 sims" = "darkgreen",
+            "20,000 sims" = "steelblue")
+    ) +
+    labs(
+        x = "Heteroplasmy (%)",
+        y = "Density"
+    ) +
+    theme_minimal() +
+    theme(
+        legend.position = "bottom",
+    )
+
+ggsave(here(plot_dir, "simulation_convergence_test.png"), p_convergence_dist, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "simulation_convergence_test.pdf"), p_convergence_dist, width = 8, height = 6)
+
+p_convergence_dist
+```
+
+```{r}
+#| label: convergence-summary-table
+#| echo: false
+
+convergence_summary_df %>%
+    mutate(
+        n_sims = format(n_sims, big.mark = ","),
+        mean_het = round(mean_het, 2),
+        sd_het = round(sd_het, 2),
+        median_het = round(median_het, 2),
+        var_het = round(var_het, 2),
+        p25_het = round(p25_het, 2),
+        p75_het = round(p75_het, 2)
+    ) %>%
+    kable(
+        row.names = FALSE,
+        col.names = c(
+            "N Simulations",
+            "Mean Het (%)",
+            "SD Het (%)",
+            "Median Het (%)",
+            "Variance",
+            "25th %ile",
+            "75th %ile",
+            "N Unique"
+        ),
+        align = c("r", "r", "r", "r", "r", "r", "r", "r"),
+        caption = "Convergence of Simulation Statistics Across Sample Sizes"
+    ) %>%
+    kable_styling(
+        bootstrap_options = c("striped", "hover"),
+        full_width = FALSE
+    )
+```
+
+The summary statistics were stable across all the sample sizes tested, indicating that the simulations achieved convergence. We used a sample size of 10,000 for hypothesis testing.
+
+#### Monte-Carlo test of normalized heteroplasmy variance
+
+We compared the normalized heteroplasmy variance [@wonnapinij2010] for the observed progeny cells to the null distribution generated from the simulations.
+
+For a cell population with heteroplasmies $(h = h_1, h_2, \ldots, h_n)$, the normalized variance is defined as:
+
+$$V'(h) = var(h) / \bar{h}(1 - \bar{h})$$
+
+where $\bar{h}$ is the mean heteroplasmy of the population and heteroplasmies are expressed as proportions (0-1).
+
+To test whether the observed variance is consistent with random segregation, we:
+
+1. Calculated the mean normalized variance across lineages from observed data
+2. Generated a null distribution of mean normalized variances from 10,000 simulations under random hypergeometric partitioning
+3. Performed a two-sided Monte Carlo test comparing the observed statistic to the null distribution
+
+The p-value was calculated as the proportion of simulated values that deviated from the null distribution mean by at least as much as the observed value:
+
+$$p = \frac{1 + \sum_{i=1}^{n} \mathbb{1}\left(|S_i - \bar{S}| \geq |S_{obs} - \bar{S}|\right)}{1 + n}$$
+
+where $S_{obs}$ is the observed mean normalized variance, $S_i$ are the simulated values, $\bar{S}$ is the mean of the null distribution, and $n = 10{,}000$. This two-tailed test assesses whether the observed variance is unusually high or low compared to random segregation.
+
+```{r}
+#| label: variance-monte-carlo-test
+#| echo: true
+#| code-summary: "Monte Carlo test for normalized heteroplasmy variance"
+
+# Function to calculate normalized heteroplasmy variance
+compute_normalized_variance <- function(heteroplasmy_values) {
+    # Ensure heteroplasmy is on a 0-1 scale (proportion)
+    if (max(heteroplasmy_values, na.rm = TRUE) > 1) {
+        heteroplasmy_values <- heteroplasmy_values / 100
+    }
+
+    mean_h <- mean(heteroplasmy_values, na.rm = TRUE)
+    var_h <- var(heteroplasmy_values, na.rm = TRUE)
+
+    # If variance is not defined, or if mean is 0 or 1, normalized variance is 0.
+    if (is.na(var_h) || mean_h == 0 || mean_h == 1) {
+        return(0)
+    }
+
+    normalized_variance <- var_h / (mean_h * (1 - mean_h))
+    return(normalized_variance)
+}
+
+# Compute observed variances for NSCs and progeny cells
+observed_statistic_variance <- mtDNA_number_data %>%
+    dplyr::filter(cell_type == "Progeny") %>%
+    group_by(lineage) %>%
+    summarize(
+        norm_var_lineage = compute_normalized_variance(heteroplasmy),
+        .groups = "drop"
+    ) %>%
+    summarize(
+        mean_norm_var = mean(norm_var_lineage, na.rm = TRUE)
+    ) %>%
+    dplyr::pull(mean_norm_var)
+
+# Unnest the simulated results list
+simulated_het_df <- purrr::imap_dfr(
+    progeny_sims,
+    ~ purrr::map_dfr(.x, ~.x, .id = "simulation_id"),
+    .id = "lineage"
+)
+
+# Null distribution
+# For each of the n_sims simulation IDs,
+# we calculate the mean normalized variance across all lineages
+null_distribution_variance <- simulated_het_df %>%
+    group_by(simulation_id, lineage) %>%
+    summarize(
+        norm_var_lineage = compute_normalized_variance(heteroplasmy),
+        .groups = "drop_last" # Drops 'lineage', keeps 'simulation_id'
+    ) %>%
+    summarize(
+        mean_norm_var = mean(norm_var_lineage, na.rm = TRUE)
+    ) %>%
+    dplyr::pull(mean_norm_var)
+
+# Monte Carlo two-sided p-value
+null_mean_variance <- mean(null_distribution_variance, na.rm = TRUE)
+p_value_variance <- (
+    sum(
+        abs(null_distribution_variance - null_mean_variance) >=
+        abs(observed_statistic_variance - null_mean_variance)) + 1) / (n_sims + 1)
+
+# Standard Error on the mean for null distribution
+se_null_variance <- sd(null_distribution_variance, na.rm = TRUE) / sqrt(length(null_distribution_variance))
+```
+
+```{r}
+#| label: fig-variance-monte-carlo
+#| fig.cap: "Monte Carlo test for normalized heteroplasmy variance in progeny cells. Null distribution generated from 10,000 simulations in red and the observed statistic indicated by the dashed line. Two-tailed Monte Carlo p-value shown."
+
+# Hypothesis testing plot for normalized heteroplasmy variance
+sim_var_plot <- ggplot(
+    data.frame(null_dist = null_distribution_variance),
+    aes(x = null_dist)) +
+    geom_histogram(
+        aes(y = after_stat(density)),
+        bins = 50,
+        alpha = 0.7,
+        fill = sim_color
+    ) +
+    geom_density(
+        color = sim_color,
+        linewidth = 1.2,
+        bw = bw.nrd0(null_distribution_variance)
+    ) +
+    geom_vline(
+        xintercept = observed_statistic_variance,
+        color = "black",
+        linetype = "dashed",
+        linewidth = 1
+    ) +
+    annotate(
+        geom = "text",
+        x = observed_statistic_variance,
+        y = Inf,
+        label = paste0("p = ", round(p_value_variance, 4)),
+        vjust = 1.5,
+        hjust = -0.1,
+        color = "black",
+        size = 4
+    ) +
+    labs(
+        x = "Mean Normalized Heteroplasmy Variance (from simulations)",
+        y = "Frequency",
+    ) +
+    theme_minimal()
+
+ggsave(here(plot_dir, "monte_carlo_normalized_variance_test.png"), sim_var_plot, width = 10, height = 6, dpi = 300)
+ggsave(here(plot_dir, "monte_carlo_normalized_variance_test.pdf"), sim_var_plot, width = 10, height = 6)
+
+sim_var_plot
+```
+
+The p-value for a two-sided Monte Carlo test comparing the observed and simulated normalized heteroplasmy variances was `r format(p_value_variance, scientific = FALSE, digits = 4)`, suggesting that the observed variance in progeny cells is not significantly different from that expected under a model of random mtDNA segregation.
+
+The standard error on the mean of the null distribution is `r format(se_null_variance, scientific = TRUE, digits = 3)`, suggesting that the estimate of the mean normalized variance from the simulations is precise.
+
+
+##### Density plots of normalized heteroplasmy variance
+
+Kernel density estimation was performed using the Gaussian kernel with bandwidth determined by Silverman's rule of thumb [@silverman1986], calculated as:
+
+$$bw = 0.9 \times \min(sd, IQR/1.34) \times n^{-1/5}$$
+
+where $sd$ is the standard deviation, $IQR$ is the interquartile range, and $n$ is the sample size.
+
+Histogram binwidths were determined using the Freedman-Diaconis rule:
+$$w = 2 \times \frac{IQR}{n^{1/3}}$$
+
+```{r}
+#| label: fig-normalized-variance-density
+#| fig.cap: "Density plots of normalized heteroplasmy variance for observed and simulated progeny cells. Kernel density estimation performed using Gaussian kernel with bandwidth determined by Silverman\\'s rule of thumb. Histogram binwidths were determined using the Freedman-Diaconis rule."
+
+observed_lineage_variances <- mtDNA_number_data %>%
+    dplyr::filter(cell_type == "Progeny") %>%
+    group_by(lineage) %>%
+    summarize(
+        norm_var_lineage = compute_normalized_variance(heteroplasmy),
+        .groups = "drop"
+    ) %>%
+    dplyr::mutate(lineage = as.character(lineage))
+
+simulated_lineage_variances <- simulated_het_df %>%
+    group_by(simulation_id, lineage) %>%
+    summarize(
+        norm_var_lineage = compute_normalized_variance(heteroplasmy),
+        .groups = "drop"
+    ) %>%
+    dplyr::mutate(lineage = as.character(lineage))
+
+norm_variance_df <- bind_rows(
+    observed_lineage_variances %>%
+        mutate(source = "Observed"),
+    simulated_lineage_variances %>%
+        mutate(source = "Simulated")
+)
+
+# Calculate histogram binwidths using Freedman-Diaconis rule
+binwidth_obs_var <- 2 * IQR(
+    norm_variance_df %>% filter(source == "Observed") %>% pull(norm_var_lineage),
+    na.rm = TRUE) / (nrow(
+        norm_variance_df %>% filter(source == "Observed")
+    )^(1/3))
+binwidth_sim_var <- 2 * IQR(
+    norm_variance_df %>% filter(source == "Simulated") %>% pull(norm_var_lineage),
+    na.rm = TRUE) / (nrow(
+        norm_variance_df %>% filter(source == "Simulated")
+    )^(1/3))
+
+binwidth_avg <- mean(c(
+    binwidth_obs_var, binwidth_sim_var))
+
+# Calculate density bandwidths using Silverman's rule of thumb
+bw_obs_var <- bw.nrd0(norm_variance_df %>% filter(source == "Observed") %>% pull(norm_var_lineage))
+bw_sim_var <- bw.nrd0(norm_variance_df %>% filter(source == "Simulated") %>% pull(norm_var_lineage))
+
+p_norm_var_density <- ggplot(
+    norm_variance_df,
+    aes(
+        x = norm_var_lineage,
+        fill = source,
+        color = source)) +
+    geom_histogram(
+        aes(y = after_stat(density)),
+        binwidth = binwidth_avg,
+        alpha = 0.5,
+        position = "identity",
+        color = NA
+    ) +
+    geom_density(
+        data = norm_variance_df %>% filter(source == "Simulated"),
+        aes(color = source),
+        fill = NA,
+        linewidth = 1,
+        bw = bw_sim_var) +
+    geom_density(
+        data = norm_variance_df %>% filter(source == "Observed"),
+        aes(color = source),
+        fill = NA,
+        linewidth = 1, bw = bw_obs_var) +
+    scale_fill_manual(
+        values = c(
+            "Observed" = progeny_color,
+            "Simulated" = sim_color
+        )) +
+    scale_color_manual(
+        values = c(
+            "Observed" = progeny_color,
+            "Simulated" = sim_color
+        )) +
+    labs(
+        x = "Normalized Heteroplasmy Variance for Progeny",
+        y = "Density"
+    ) +
+    theme_minimal() +
+    theme(
+        legend.position = "inside",
+        legend.position.inside = c(0.85, 0.85),
+        legend.title = element_blank()
+    )
+
+ggsave(here(plot_dir, "normalized_variance_density_observed_vs_simulated.png"), p_norm_var_density, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "normalized_variance_density_observed_vs_simulated.pdf"), p_norm_var_density, width = 8, height = 6)
+
+p_norm_var_density
+```
+
+##### Density plots of normalized heteroplasmy variance per lineage
+
+```{r}
+#| label: fig-per-lineage-normalized-variance-densities
+#| fig.cap: "Null distributions from 10,000 random segregation simulations (red density plots) for each lineage. The corresponding observed normalized variance is marked by the dashed blue line. Kernel density estimation performed using Gaussian kernel with bandwidth determined by Silverman\\'s rule of thumb."
+#| fig.width: 8
+#| fig.height: 10
+
+norm_variance_df_lineage <- norm_variance_df %>%
+    mutate(lineage = factor(lineage, levels = names(lineage_labels))) %>%
+    mutate(lineage_label = factor(
+        paste("Lineage", lineage),
+        levels = paste("Lineage", names(lineage_labels))
+    ))
+
+bw_sim_all <- bw.nrd0(
+    norm_variance_df_lineage %>%
+        filter(source == "Simulated") %>%
+        pull(norm_var_lineage)
+)
+
+p_norm_var_density_lineage <- ggplot(
+    norm_variance_df_lineage,
+    aes(x = norm_var_lineage, color = source, fill = source)
+) +
+    geom_density(
+        data = norm_variance_df_lineage %>% filter(source == "Simulated"),
+        aes(fill = "Simulated", color = "Simulated"),
+        alpha = 0.6,
+        linewidth = 0.8,
+        bw = bw_sim_all
+    ) +
+    geom_vline(
+        data = norm_variance_df_lineage %>% filter(source == "Observed"),
+        aes(xintercept = norm_var_lineage, linetype = "Observed"),
+        color = progeny_color,
+        linewidth = 0.8
+    ) +
+    facet_wrap(
+        ~ lineage_label,
+        ncol = 3,
+        scales = "fixed",
+        labeller = labeller(lineage = lineage_labels)
+    ) +
+    scale_fill_manual(
+        values = c("Simulated" = sim_color),
+        name = NULL
+    ) +
+    scale_color_manual(
+        values = c("Simulated" = sim_color),
+        name = NULL
+    ) +
+    scale_linetype_manual(
+        values = c("Observed" = "dashed"),
+        name = NULL
+    ) +
+    labs(
+        x = "Normalized Variance",
+        y = "Density"
+    ) +
+    theme_minimal() +
+    theme(
+        strip.text = element_text(size = 10),
+        legend.position = "bottom",
+        panel.grid.minor = element_blank()
+    ) +
+    coord_cartesian(xlim = c(0, 0.6))
+
+ggsave(here(plot_dir, "normalized_variance_density_per_lineage.png"), p_norm_var_density_lineage, width = 8, height = 10, dpi = 300)
+ggsave(here(plot_dir, "normalized_variance_density_per_lineage.pdf"), p_norm_var_density_lineage, width = 8, height = 10)
+
+p_norm_var_density_lineage
+```
+
+#### Monte-Carlo test of normalized heteroplasmy shift
+
+We then compared the normalized heteroplasmy shift [@johnston2016] for the observed progeny cells to the null distribution generated from the simulations.
+The normalized heteroplasmy shift is calculated as:
+
+$$\Delta h' = \ln\left( \frac{h_{Progeny}(1 - h_{NSC})} {(1 - h_{Progeny})h_{NSC}} \right)$$
+
+where $h_{NSC}$ and $h_{Progeny}$ represent heteroplasmy as proportions (0-1).
+
+To test whether observed shifts deviate from random segregation:
+
+1. We calculated the mean heteroplasmy shift per lineage (averaged across ~6 progeny cells per lineage), then took the mean across all 14 lineages as our test statistic
+2. We generated a null distribution from 10,000 simulations of random hypergeometric partitioning, calculating the same statistic for each simulated dataset
+3. We performed a two-sided Monte Carlo test comparing the observed mean shift to the null distribution
+
+The p-value was calculated as the proportion of simulated values that deviated from the null distribution mean by at least as much as the observed value:
+
+$$p = \frac{1 + \sum_{i=1}^{n} \mathbb{1}\left(|S_i - \bar{S}| \geq |S_{obs} - \bar{S}|\right)}{1 + n}$$
+
+where $S_{obs}$ is the observed mean heteroplasmy shift, $S_i$ are the simulated values, $\bar{S}$ is the mean of the null distribution, and $n = 10{,}000$. This two-tailed test assesses whether the observed shift is unusually large in either direction compared to random segregation.
+
+
+```{r}
+#| label: het-shift-monte-carlo-test
+#| echo: true
+#| code-summary: "Monte Carlo test for normalized heteroplasmy shift"
+
+# Function to calculate heteroplasmy shift from NSC to progeny cells
+compute_heteroplasmy_shift <- function(nsc_heteroplasmy, progeny_heteroplasmy, nsc_cn, progeny_cn) {
+    p_nsc <- nsc_heteroplasmy / 100
+    p_progeny <- progeny_heteroplasmy / 100
+
+    # Squeeze values to avoid -Inf/Inf at 0 and 1
+    # Calculate epsilon based on half a molecule in the largest pool
+    epsilon <- 1 / (2 *max(c(nsc_cn, progeny_cn)))
+    p_nsc <- pmax(epsilon, pmin(1 - epsilon, p_nsc))
+    p_progeny <- pmax(epsilon, pmin(1 - epsilon, p_progeny))
+
+    heteroplasmy_shift <- log(
+        (p_progeny * (1 - p_nsc)) /
+            ((1 - p_progeny) * p_nsc)
+    )
+
+    return(heteroplasmy_shift)
+}
+
+observed_nsc_data <- mtDNA_number_data %>%
+    filter(cell_type == "NSC") %>%
+    select(
+        lineage,
+        heteroplasmy_nsc = heteroplasmy,
+        cn_nsc = mtDNA_total)
+
+# Calculate the observed heteroplasmy shifts
+observed_statistic_shift <- mtDNA_number_data %>%
+    filter(cell_type == "Progeny") %>%
+    left_join(observed_nsc_data, by = "lineage") %>%
+    mutate(
+        het_shift = compute_heteroplasmy_shift(
+            nsc_heteroplasmy = heteroplasmy_nsc,
+            progeny_heteroplasmy = heteroplasmy,
+            nsc_cn = cn_nsc,
+            progeny_cn = mtDNA_total)
+    ) %>%
+    group_by(lineage) %>%
+    summarize(
+        mean_het_shift_lineage = mean(het_shift, na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    summarize(
+        mean_het_shift = mean(mean_het_shift_lineage, na.rm = TRUE)
+    ) %>%
+    pull(mean_het_shift)
+
+simulated_het_shifts_df <- simulated_het_df %>%
+    dplyr::mutate(
+        lineage = as.numeric(lineage)) %>%
+    dplyr::left_join(observed_nsc_data, by = "lineage") %>%
+    dplyr::mutate(
+        het_shift = compute_heteroplasmy_shift(
+            nsc_heteroplasmy = heteroplasmy_nsc,
+            progeny_heteroplasmy = heteroplasmy,
+            nsc_cn = cn_nsc,
+            progeny_cn = mtDNA_total)
+    )
+
+# Null distribution at the lineage level
+null_distribution_shift <- simulated_het_shifts_df %>%
+    group_by(simulation_id, lineage) %>%
+    summarize(
+        mean_het_shift_lineage = mean(het_shift, na.rm = TRUE),
+        .groups = "drop_last"
+    ) %>%
+    summarize(
+        mean_het_shift = mean(mean_het_shift_lineage, na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    pull(mean_het_shift)
+
+# Monte Carlo two-sided p-value
+null_mean_shift <- mean(null_distribution_shift, na.rm = TRUE)
+p_value_shift <- (
+    sum(
+        abs(null_distribution_shift - null_mean_shift) >=
+        abs(observed_statistic_shift - null_mean_shift)) + 1) / (n_sims + 1)
+
+# Standard Error on the mean for null distribution
+se_null_shift <- sd(null_distribution_shift, na.rm = TRUE) / sqrt(length(null_distribution_shift))
+```
+
+```{r}
+#| label: fig-het-shift-monte-carlo
+#| fig.cap: "Monte Carlo test for normalized heteroplasmy shift in progeny cells. Null distribution generated from 10,000 simulations in red and the observed statistic indicated by the dashed line. Two-tailed Monte Carlo p-value shown."
+
+sim_shift_plot <- ggplot(
+    data.frame(null_dist = null_distribution_shift),
+    aes(x = null_dist)) +
+    geom_histogram(
+        aes(y = after_stat(density)),
+        bins = 50,
+        alpha = 0.7,
+        fill = sim_color
+    ) +
+    geom_density(
+        color = sim_color,
+        linewidth = 1.2,
+        bw = bw.nrd0(null_distribution_shift)
+    ) +
+    geom_vline(
+        xintercept = observed_statistic_shift,
+        color = "black",
+        linetype = "dashed",
+        linewidth = 1
+    ) +
+    annotate(
+        geom = "text",
+        x = observed_statistic_shift,
+        y = Inf,
+        label = paste0("p = ", round(p_value_shift, 4)),
+        vjust = 1.5,
+        hjust = -0.1,
+        color = "black",
+        size = 4
+    ) +
+    labs(
+        x = "Mean Heteroplasmy Shift (from simulations)",
+        y = "Frequency",
+    ) +
+    theme_minimal()
+
+ggsave(here(plot_dir, "monte_carlo_heteroplasmy_shift_test.png"), sim_shift_plot, width = 10, height = 6, dpi = 300)
+ggsave(here(plot_dir, "monte_carlo_heteroplasmy_shift_test.pdf"), sim_shift_plot, width = 10, height = 6)
+
+sim_shift_plot
+```
+
+The p-value for a two-sided Monte Carlo test comparing the observed and simulated mean heteroplasmy shifts was `r format(p_value_shift, scientific = TRUE, digits = 3)`, suggesting that the observed shift in progeny cells is significantly different from that expected under a model of random mtDNA segregation.
+
+The standard error on the mean of the null distribution is `r format(se_null_shift, scientific = TRUE, digits = 3)`, suggesting that the estimate of the mean heteroplasmy shift from the simulations is precise.
+
+##### Density plots of heteroplasmy shifts
+
+Kernel density estimation was performed using the Gaussian kernel with bandwidth determined by Silverman's rule of thumb [@silverman1986], calculated as:
+
+$$bw = 0.9 \times \min(sd, IQR/1.34) \times n^{-1/5}$$
+
+where $sd$ is the standard deviation, $IQR$ is the interquartile range, and $n$ is the sample size.
+
+Histogram binwidths were determined using the Freedman-Diaconis rule:
+
+$$w = 2 \times \frac{IQR}{n^{1/3}}$$
+
+```{r}
+#| label: fig-heteroplasmy-shift-density-plots
+#| fig.cap: "Density plots of heteroplasmy shifts for observed and simulated progeny cells. Kernel density estimation performed using Gaussian kernel with bandwidth determined by Silverman\\'s rule of thumb. Histogram binwidths were determined using Freedman-Diaconis rule."
+
+observed_lineage_shifts <- mtDNA_number_data %>%
+    filter(cell_type == "Progeny") %>%
+    left_join(observed_nsc_data, by = "lineage") %>%
+    mutate(
+        het_shift = compute_heteroplasmy_shift(
+            nsc_heteroplasmy = heteroplasmy_nsc,
+            progeny_heteroplasmy = heteroplasmy,
+            nsc_cn = cn_nsc,
+            progeny_cn = mtDNA_total
+        ),
+        source = "Observed"
+    ) %>%
+    group_by(lineage) %>%
+    summarize(
+        mean_het_shift_lineage = mean(het_shift, na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    mutate(source = "Observed") %>%
+    select(mean_het_shift_lineage, source)
+
+simulated_lineage_shifts <- simulated_het_shifts_df %>%
+    group_by(simulation_id, lineage) %>%
+    summarize(
+        mean_het_shift_lineage = mean(het_shift, na.rm = TRUE),
+        .groups = "drop"
+    ) %>%
+    mutate(source = "Simulated") %>%
+    select(mean_het_shift_lineage, source)
+
+het_shift_df <- bind_rows(
+    observed_lineage_shifts,
+    simulated_lineage_shifts
+)
+
+# Calculate density bandwidths using Silverman's rule of thumb
+bw_obs_het_shift <- bw.nrd0(
+    het_shift_df %>%
+    filter(source == "Observed") %>%
+    pull(mean_het_shift_lineage)
+)
+bw_sim_het_shift <- bw.nrd0(
+    het_shift_df %>%
+    filter(source == "Simulated") %>%
+    pull(mean_het_shift_lineage)
+)
+
+# Calculate histogram binwidths using Freedman-Diaconis rule
+binwidth_obs_het_shift <- 2 * IQR(
+    het_shift_df %>% filter(source == "Observed") %>% pull(mean_het_shift_lineage),
+    na.rm = TRUE) / (nrow(
+        het_shift_df %>% filter(source == "Observed")
+    )^(1/3))
+binwidth_sim_het_shift <- 2 * IQR(
+    het_shift_df %>% filter(source == "Simulated") %>% pull(mean_het_shift_lineage),
+    na.rm = TRUE) / (nrow(
+        het_shift_df %>% filter(source == "Simulated")
+    )^(1/3))
+
+binwidth_avg_het_shift <- mean(c(
+    binwidth_obs_het_shift, binwidth_sim_het_shift))
+
+p_het_shift_density <- ggplot(
+    het_shift_df,
+    aes(
+        x = mean_het_shift_lineage,
+        fill = source,
+        color = source)
+    ) +
+    geom_histogram(
+        aes(y = after_stat(density)),
+        binwidth = binwidth_avg_het_shift,
+        alpha = 0.5,
+        position = "identity",
+        color = NA
+    ) +
+    geom_density(
+        data = het_shift_df %>%
+            filter(source == "Simulated"),
+        aes(color = source),
+        fill = NA,
+        linewidth = 1,
+        bw = bw_sim_het_shift) +
+    geom_density(
+        data = het_shift_df %>%
+            filter(source == "Observed"),
+        aes(color = source),
+        fill = NA,
+        linewidth = 1,
+        bw = bw_obs_het_shift) +
+    scale_fill_manual(
+        values = c(
+            "Observed" = progeny_color,
+            "Simulated" = sim_color
+        )) +
+    scale_color_manual(
+        values = c(
+            "Observed" = progeny_color,
+            "Simulated" = sim_color
+        )) +
+    labs(
+        x = "Heteroplasmy Shift for Progeny",
+        y = "Density"
+    ) +
+    theme_minimal() +
+    theme(
+        legend.position = "inside",
+        legend.position.inside = c(0.85, 0.85),
+        legend.title = element_blank()
+    )
+
+ggsave(here(plot_dir, "heteroplasmy_shift_density_observed_vs_simulated.png"), p_het_shift_density, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "heteroplasmy_shift_density_observed_vs_simulated.pdf"), p_het_shift_density, width = 8, height = 6)
+
+p_het_shift_density
+```
+
+##### Density plots of heteroplasmy shifts per lineage
+
+```{r}
+#| label: fig-per-lineage-heteroplasmy-shift-densities
+#| fig.width: 8
+#| fig.height: 10
+#| fig-cap: "Density plots of the observed progeny heteroplasmy (light blue) overlaid on the null distribution from 10,000 random segregation simulations (red) for each lineage. The heteroplasmy of the parent NSC for each lineage is marked by the dashed line. Kernel density estimation performed using Gaussian kernel with bandwidth = 2.5 times Silverman\\'s rule of thumb, scaled to increase smoothing."
+
+het_lineage_data <- bind_rows(
+    mtDNA_number_data %>%
+        filter(cell_type == "Progeny") %>%
+        select(lineage, heteroplasmy) %>%
+        mutate(
+            lineage = as.character(lineage),
+            lineage_label = paste("Lineage ", lineage),
+            source = "Observed progeny"
+        ),
+    simulated_het_shifts_df %>%
+        select(simulation_id, lineage, heteroplasmy) %>%
+        mutate(
+            lineage = as.character(lineage),
+            lineage_label = paste("Lineage ", lineage),
+            source = "Simulated progeny"
+        )
+) %>%
+    mutate(
+        lineage_label = factor(
+            lineage_label,
+            levels = paste("Lineage ", sort(unique(as.numeric(lineage))))
+        )
+    )
+
+nsc_het_data <- observed_nsc_data %>%
+    select(lineage, heteroplasmy_nsc) %>%
+    mutate(
+        lineage = as.character(lineage),
+        lineage_label = factor(
+            paste("Lineage ", lineage),
+            levels = paste("Lineage ", sort(unique(as.numeric(lineage))))
+        )
+    )
+
+bw_obs_progeny <- bw.nrd0(
+    het_lineage_data %>%
+        filter(source == "Observed progeny") %>%
+        pull(heteroplasmy)
+) * 2.5
+
+bw_sim_progeny <- bw.nrd0(
+    het_lineage_data %>%
+        filter(source == "Simulated progeny") %>%
+        pull(heteroplasmy)
+) * 2.5
+
+p_het_shift_lineage <- ggplot(
+    het_lineage_data,
+    aes(x = heteroplasmy)) +
+    geom_density(
+        data = het_lineage_data %>% filter(source == "Observed progeny"),
+        aes(fill = "Observed progeny", color = "Observed progeny"),
+        alpha = 0.5,
+        linewidth = 0.8,
+        bw = bw_obs_progeny
+    ) +
+    geom_density(
+        data = het_lineage_data %>% filter(source == "Simulated progeny"),
+        aes(fill = "Simulated progeny", color = "Simulated progeny"),
+        alpha = 0.5,
+        linewidth = 0.8,
+        bw = bw_sim_progeny
+    ) +
+    geom_vline(
+        data = nsc_het_data,
+        aes(xintercept = heteroplasmy_nsc, linetype = "Observed NSCs"),
+        color = NSC_color,
+        linewidth = 0.8
+    ) +
+    facet_wrap(~ lineage_label, ncol = 3, scales = "fixed") +
+    scale_fill_manual(
+        values = c(
+            "Observed progeny" = progeny_color,
+            "Simulated progeny" = sim_color
+        ),
+        name = NULL
+    ) +
+    scale_color_manual(
+        values = c(
+            "Observed progeny" = progeny_color,
+            "Simulated progeny" = sim_color
+        ),
+        name = NULL
+    ) +
+    scale_linetype_manual(
+        values = c("Observed NSCs" = "dashed"),
+        name = NULL
+    ) +
+    labs(
+        x = "Heteroplasmy (%)",
+        y = "Density"
+    ) +
+    guides(
+        fill = guide_legend(order = 1),
+        color = guide_legend(order = 1),
+        linetype = guide_legend(order = 2)
+    ) +
+    theme_minimal() +
+    theme(
+        strip.text = element_text(size = 10),
+        legend.position = "bottom",
+        panel.grid.minor = element_blank()
+    ) +
+    coord_cartesian(xlim = c(0, 100))
+
+ggsave(here(plot_dir, "heteroplasmy_shift_density_per_lineage.png"), p_het_shift_lineage, width = 8, height = 10, dpi = 300)
+ggsave(here(plot_dir, "heteroplasmy_shift_density_per_lineage.pdf"), p_het_shift_lineage, width = 8, height = 10)
+
+p_het_shift_lineage
+```
+
+
+### Approximate Bayesian Computation (ABC) analysis
+
+To formally test whether selection is acting during neurogenesis, we performed an Approximate Bayesian Computation (ABC) analysis [@beaumont2002], a simulation-inference framework where likelihoods are approximated by comparing observed and simulated summary statistics.
+
+The ABC workflow involved:
+
+1. Summary statistics selection: Identifying the most informative features of the data
+2. Model selection to determine whether selection or pure drift better explains the observed patterns
+3. Parameter estimation to quantify the selection coefficient (s) against mutant mtDNA
+
+#### Simulation Models
+
+We compared two alternative models of mtDNA inheritance:
+
+**Model 1: Pure Bottleneck (s = 0)**: mtDNA molecules are randomly partitioned to progeny cells through hypergeometric sampling without replacement. Each progeny sequentially draws mtDNA molecules from the NSC pool, which updates after each draw.
+
+**Model 2: Selection + Bottleneck (s ≠ 0)**: Selection modifies mtDNA frequencies before partitioning If $p$ is the initial mutant mtDNA proportion in the NSC, the post-selection proportion $p'$ is given by:
+
+$$p' = \frac{p(1+s)}{p(1+s) + (1-p)}$$
+
+where $s$ is the selection coefficient. Negative $s$ values  indicate purifying selection against mutant mtDNA. After selection, segregation proceeds as in Model 1.
+
+Both models used observed NSC counts and progeny copy numbers for each lineage, ensuring simulations matched the actual bottleneck severity and starting heteroplasmy.
+
+
+```{r}
+#| label: abc-analysis-setup
+#| echo: true
+#| code-summary: "Model definitions for ABC analysis"
+
+# Model 1: Random segregation; no selection (s = 0)
+# Same algorithm as the simulate_lineage_hypergeometric() function
+simulate_pure_bottleneck <- function(nsc_wt, nsc_mut, observed_totals) {
+
+    # Update mtDNA pool after each draw
+    remaining_wt <- nsc_wt
+    remaining_mut <- nsc_mut
+    mut_samples <- numeric(length(observed_totals))
+
+    for (i in seq_along(observed_totals)) {
+        current_pool <- remaining_wt + remaining_mut
+        if (current_pool == 0) {
+            mut_samples[i] <- 0
+            next
+        }
+        k_draw <- min(observed_totals[i], current_pool)
+        drawn_wt <- rhyper(
+            1,
+            m = remaining_wt,
+            n = remaining_mut,
+            k = k_draw
+        )
+        mut_samples[i] <- k_draw - drawn_wt
+        remaining_wt <- remaining_wt - drawn_wt
+        remaining_mut <- remaining_mut - mut_samples[i]
+    }
+
+    # Handle cases where observed_totals is 0 to avoid NaN
+    het_values <- (mut_samples / observed_totals) * 100
+    het_values[is.nan(het_values)] <- 0
+    return(het_values)
+}
+
+# Model 2: Selection before division (s != 0)
+simulate_selection <- function(nsc_wt, nsc_mut, observed_totals, s) {
+
+    total_pool <- nsc_wt + nsc_mut
+    het_nsc <- nsc_mut / total_pool
+    w_mut <- 1 + s
+    freq_mut_eff <- (het_nsc * w_mut) / (het_nsc * w_mut + (1 - het_nsc))
+    eff_mut <- round(freq_mut_eff * total_pool)
+    eff_mut <- max(0, min(eff_mut, total_pool))
+    eff_wt <- total_pool - eff_mut
+
+    return(simulate_pure_bottleneck(
+        nsc_wt = eff_wt,
+        nsc_mut = eff_mut,
+        observed_totals = observed_totals
+    ))
+}
+```
+
+
+#### Summary statistics selection for ABC
+
+We evaluated 14 candidate summary statistics using Random Forest variable importance measures [@raynal2019]. For each lineage, we simulated 5,000 datasets with $s \sim \mathcal{U}(-1, 0.1)$, calculated all summary statistics, and trained a regression ABC-RF model to predict $s$ from the statistics and extracted variable importance scores.
+
+```{r}
+#| label: summary-statistics-selection
+#| cache: true
+#| echo: true
+#| code-summary: "Summary statistics calculation and selection for ABC analysis"
+
+# Calculate all summary statistics for initial testing
+calc_summary_stats <- function(progeny_het, nsc_het, nsc_cn, progeny_cn, stats_list) {
+    # Return NA values if data is insufficient for calculations
+    if (all(is.na(progeny_het)) || length(progeny_het) < 2) {
+        return(setNames(rep(NA, length(stats_list)), stats_list))
+    }
+
+    # Calculate heteroplasmy shifts using the robust, data-driven epsilon method
+    het_shifts <- compute_heteroplasmy_shift(rep(nsc_het, length(progeny_het)), progeny_het, rep(nsc_cn, length(progeny_het)), progeny_cn)
+
+    # Squeeze values for skewness/kurtosis to avoid issues at the boundaries
+    progeny_het_squeezed <- pmax(0.001, pmin(99.999, progeny_het))
+
+    # Initialize an empty list to store results
+    results <- list()
+
+    # Dynamically calculate only the requested statistics
+    for (stat in stats_list) {
+        results[[stat]] <- switch(
+            stat,
+            "mean_het" = mean(progeny_het, na.rm = TRUE),
+            "var_het" = var(progeny_het, na.rm = TRUE),
+            "median_het" = median(progeny_het, na.rm = TRUE),
+            "mean_shift" = mean(het_shifts, na.rm = TRUE),
+            "var_shift" = var(het_shifts, na.rm = TRUE),
+            "min_het" = min(progeny_het, na.rm = TRUE),
+            "max_het" = max(progeny_het, na.rm = TRUE),
+            "q25_het" = {
+                q <- quantile(progeny_het, 0.25, na.rm = TRUE)
+                names(q) <- NULL  # Remove the "25%" name
+                q
+            },
+            "q75_het" = {
+                q <- quantile(progeny_het, 0.75, na.rm = TRUE)
+                names(q) <- NULL  # Remove the "75%" name
+                q
+            },
+            "skew_het" = moments::skewness(progeny_het_squeezed, na.rm = TRUE),
+            "kurt_het" = moments::kurtosis(progeny_het_squeezed, na.rm = TRUE),
+            "mad_het" = mad(progeny_het, na.rm = TRUE),
+            "prop_below_nsc" = mean(progeny_het < nsc_het, na.rm = TRUE),
+            "norm_var" = compute_normalized_variance(progeny_het),
+            NA  # Default case if the stat is not recognized
+        )
+    }
+
+    # Return the results as a named vector
+    return(unlist(results))
+}
+
+select_summary_stats <- function(
+    mtDNA_data, stats_list = c("mean_het", "var_het", "median_het", "mean_shift", "var_shift", "min_het", "max_het", "q25_het", "q75_het", "skew_het", "kurt_het", "mad_het", "prop_below_nsc", "norm_var")) {
+
+    # Number of simulations for testing
+    n_rf_sims <- 5000
+
+    all_lineage_var_imp_df <- purrr::map_dfr(unique(mtDNA_data$lineage), ~{
+
+        lineage_id <- .x
+
+        # Filter data for current lineage
+        lineage_data <- dplyr::filter(mtDNA_data, lineage == lineage_id)
+        nsc_data <- dplyr::filter(lineage_data, cell_type == "NSC")
+        progeny_data <- dplyr::filter(lineage_data, cell_type == "Progeny")
+
+        # Generate the reference table for this lineage
+        # Prior distribution for s
+        prior_s_rf <- runif(n_rf_sims, min = -1, max = 0.1)
+
+        summary_stats_matrix <- t(sapply(prior_s_rf, function(s) {
+
+            # Run simulations under selection model
+            sim_het <- simulate_selection(
+                nsc_wt = nsc_data$mtDNA_wt,
+                nsc_mut = nsc_data$mtDNA_mut,
+                observed_totals = progeny_data$mtDNA_total,
+                s = s
+            )
+
+            # Calculate summary statistics for the simulated data
+            calc_summary_stats(
+                progeny_het = sim_het,
+                nsc_het = nsc_data$heteroplasmy,
+                nsc_cn = nsc_data$mtDNA_total,
+                progeny_cn = progeny_data$mtDNA_total,
+                stats_list = stats_list
+            )
+        }))
+
+        ref_table <- data.frame(
+            s = prior_s_rf,
+            as.data.frame(summary_stats_matrix)
+        )
+
+        # Filter out NA values
+        ref_table <- ref_table %>% dplyr::filter(complete.cases(.))
+
+        # Train the regABCRF model
+        abc_rf_model <- regAbcrf(
+            s ~ .,
+            data = ref_table,
+            ntree = 500,
+            paral = TRUE
+        )
+
+        # Extract variable importance
+        (data.frame(
+            lineage = lineage_id,
+            Statistic = names(abc_rf_model$model.rf$variable.importance),
+            Importance = abc_rf_model$model.rf$variable.importance
+        ))
+    })
+
+    return(all_lineage_var_imp_df)
+
+}
+
+var_importance_res <- select_summary_stats(mtDNA_number_data)
+
+selected_stats <- var_importance_res %>%
+    dplyr::group_by(Statistic) %>%
+    summarize(MedianImportance = median(Importance, na.rm = TRUE)) %>%
+    arrange(desc(MedianImportance)) %>%
+    slice_head(n = 5) %>%
+    dplyr::pull(Statistic) %>%
+    as.character()
+
+```
+
+```{r}
+#| label: fig-variable-importance
+#| fig-cap: "Variable importance of 14 candidate summary statistics for ABC parameter estimation. Box plots show Random Forest variable importance scores across all 14 lineages, ranked by median importance. The top 5 statistics (mean heteroplasmy, normalized heteroplasmy shift, median heteroplasmy, and 25th and 75th percentiles of the heteroplasmy distribution) were selected for downstream ABC analysis based on their discriminatory power for estimating selection coefficients."
+
+# Create a labeller function that returns expressions
+stat_labeller <- function(var) {
+    labels <- c(
+        "mean_het" = "Mean Heteroplasmy",
+        "var_het" = "Heteroplasmy Variance",
+        "median_het" = "Median Heteroplasmy",
+        "mean_shift" = "Normalized Heteroplasmy Shift",
+        "var_shift" = "Variance of Heteroplasmy Shift",
+        "min_het" = "Minimum Heteroplasmy",
+        "max_het" = "Maximum Heteroplasmy",
+        "q25_het" = "25th Percentile",
+        "q75_het" = "75th Percentile",
+        "skew_het" = "Skewness",
+        "kurt_het" = "Kurtosis",
+        "mad_het" = "Median Absolute Deviation",
+        "prop_below_nsc" = "Proportion Below NSC Heteroplasmy",
+        "norm_var" = "Normalized Heteroplasmy Variance"
+    )
+    # Return the label for each variable
+    labels[as.character(var)]
+}
+
+plot_variable_importance <- function(var_imp_df) {
+    # Calculate median importance for ordering (DESCENDING)
+    statistic_order <- var_imp_df %>%
+        group_by(Statistic) %>%
+        summarize(MedianImportance = median(Importance, na.rm = TRUE)) %>%
+        arrange(MedianImportance) %>%
+        pull(Statistic)
+
+    var_imp_df$Statistic <- factor(
+        var_imp_df$Statistic,
+        levels = statistic_order
+    )
+
+    ggplot(var_imp_df, aes(x = Statistic, y = Importance)) +
+        geom_boxplot(
+            outlier.size = 0.5,
+            fill = "steelblue",
+            alpha = 0.7,
+            width = 0.6
+        ) +
+        scale_x_discrete(labels = stat_labeller) +
+        coord_flip() +
+        labs(x = NULL, y = "Variable Importance") +
+        theme_minimal() +
+        theme(
+            axis.text.y = element_text(size = 10),
+            panel.grid.major.y = element_blank()
+        )
+}
+
+# Create and display plot
+var_imp_plot <- plot_variable_importance(var_importance_res)
+
+ggsave(here(plot_dir, "abc_summary_statistics_variable_importance.png"), var_imp_plot, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "abc_summary_statistics_variable_importance.pdf"), var_imp_plot, width = 8, height = 6)
+
+var_imp_plot
+```
+
+Based on the variable importance results, we selected the top five summary statistics for ABC model selection and parameter estimation:
+
+```{r}
+#| label: abc-selected-summary-statistics-table
+
+# Manual mapping in case the order is different
+stat_descriptions <- c(
+    "mean_het" = "Mean heteroplasmy across progeny",
+    "var_het" = "Variance in progeny heteroplasmy",
+    "median_het" = "Median heteroplasmy across progeny",
+    "mean_shift" = "Mean change in heteroplasmy from NSC to progeny",
+    "var_shift" = "Variance of heteroplasmy shifts from NSC",
+    "min_het" = "Minimum heteroplasmy observed in progeny",
+    "max_het" = "Maximum heteroplasmy observed in progeny",
+    "q25_het" = "25th percentile of progeny heteroplasmy",
+    "q75_het" = "75th percentile of progeny heteroplasmy",
+    "skew_het" = "Skewness of progeny heteroplasmy distribution",
+    "kurt_het" = "Kurtosis of progeny heteroplasmy distribution",
+    "mad_het" = "Median absolute deviation of progeny heteroplasmy",
+    "prop_below_nsc" = "Proportion of progeny with heteroplasmy below NSC",
+    "norm_var" = "Normalized variance relative to binomial expectation"
+)
+
+selected_stats_table <- data.frame(
+    Rank = 1:length(selected_stats),
+    Label = sapply(selected_stats, function(x) stat_labeller(x)),
+    Description = stat_descriptions[selected_stats],
+    `Median Importance` = sapply(selected_stats, function(stat) {
+        var_importance_res %>%
+            filter(Statistic == stat) %>%
+            summarize(med = median(Importance, na.rm = TRUE)) %>%
+            pull(med)
+    })
+)
+
+knitr::kable(
+    selected_stats_table,
+    row.names = FALSE,
+    col.names = c("Rank", "Summary Statistic", "Description", "Median Importance"),
+    caption = "Top 5 summary statistics selected for ABC inference",
+    align = "cllr",
+    digits = 1
+) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"))
+```
+
+
+#### ABC Model Selection using ABC-RF
+
+We used ABC Random Forest (ABC-RF) classification [@pudlo2016] to compare the two models (pure drift vs. selection + drift). For each lineage, we simulated 10,000 datasets (5,000 per model), calculated the five selected summary statistics, and trained an ABC-RF classifier to predict the model from the statistics. We then predicted the best model for the observed data and calculated posterior probabilities, Bayes factors ($\text{BF} = P(\text{selection})/P(\text{drift})$)
+
+```{r}
+#| label: abc-model-choice
+#| cache: true
+#| echo: true
+#| code-summary: "ABC model choice using ABC-RF"
+
+abcrf_model_choice <- function(
+    mtDNA_data,
+    selected_stats,
+    n_particles = 10000) {
+
+    all_lineages <- unique(mtDNA_data$lineage)
+    all_models <- list()
+
+    model_choice_results <- map_dfr(all_lineages, function(lineage_num) {
+        lineage_data <- filter(mtDNA_data, lineage == lineage_num)
+        nsc_data <- filter(lineage_data, cell_type == "NSC")
+        progeny_data <- filter(lineage_data, cell_type == "Progeny")
+
+        # Calculate summary statistics
+        target_stats <- calc_summary_stats(
+            progeny_het = progeny_data$heteroplasmy,
+            nsc_het = nsc_data$heteroplasmy,
+            nsc_cn = nsc_data$mtDNA_total,
+            progeny_cn = progeny_data$mtDNA_total,
+            stats_list = selected_stats
+        )
+
+        # Return NA if invalid
+        if (any(is.na(target_stats))) {
+            warning(sprintf("Lineage %d: NA in summary statistics", lineage_num))
+            return(data.frame(
+                lineage = lineage_num,
+                model_selected = NA,
+                prob_drift = NA,
+                prob_selection = NA,
+                bayes_factor = NA,
+                log_bf = NA,
+                evidence_strength = "Failed"
+            ))
+        }
+
+        # Simulate and calculate summary stats
+        simulate_stats <- function(model_type, s = NULL) {
+            if (model_type == "drift") {
+                sim_het <- simulate_pure_bottleneck(
+                    nsc_wt = nsc_data$mtDNA_wt,
+                    nsc_mut = nsc_data$mtDNA_mut,
+                    observed_totals = progeny_data$mtDNA_total
+                )
+            } else if (model_type == "selection") {
+                s <- runif(1, -1, 0.1)
+                sim_het <- simulate_selection(
+                    nsc_wt = nsc_data$mtDNA_wt,
+                    nsc_mut = nsc_data$mtDNA_mut,
+                    observed_totals = progeny_data$mtDNA_total,
+                    s = s
+                )
+            }
+
+            calc_summary_stats(
+                progeny_het = sim_het,
+                nsc_het = nsc_data$heteroplasmy,
+                nsc_cn = nsc_data$mtDNA_total,
+                progeny_cn = progeny_data$mtDNA_total,
+                stats_list = selected_stats
+            )
+        }
+
+        # Generate reference table
+        n_sims_per_model <- n_particles / 2
+
+        drift_sims <- replicate(n_sims_per_model, {
+            simulate_stats("drift")
+        }, simplify = FALSE)
+
+        selection_sims <- replicate(n_sims_per_model, {
+            simulate_stats("selection")
+        }, simplify = FALSE)
+
+        ref_table <- data.frame(
+            rbind(
+                do.call(rbind, drift_sims),
+                do.call(rbind, selection_sims)
+            ),
+            model = factor(
+                rep(c("drift", "selection"), each = n_sims_per_model)
+            )
+        )
+
+        ref_table <- ref_table[complete.cases(ref_table), ]
+
+        # Train ABC Random Forest
+        abcrf_model <- abcrf(
+            model ~ .,
+            data = ref_table,
+            ntree = 500,
+            paral = FALSE
+        )
+
+        all_models[[as.character(lineage_num)]] <<- abcrf_model
+
+        target_obs <- as.data.frame(t(target_stats))
+        colnames(target_obs) <- selected_stats
+
+        prediction <- predict(
+            abcrf_model,
+            obs = target_obs,
+            training = ref_table,
+            ntree = 500,
+            paral = FALSE
+        )
+
+        # Extract results with Inf protection
+        prob_selection <- pmin(prediction$post.prob, 0.999)
+        prob_drift <- pmax(1 - prediction$post.prob, 0.001)
+        bayes_factor <- prob_selection / prob_drift
+
+        data.frame(
+            lineage = lineage_num,
+            model_selected = as.character(prediction$allocation),
+            prob_drift = prob_drift,
+            prob_selection = prob_selection,
+            bayes_factor = bayes_factor,
+            log_bf = log(bayes_factor)
+        )
+    })
+
+    return(list(results = model_choice_results, models = all_models))
+}
+
+# Run abcrf model choice
+abc_output <- abcrf_model_choice(
+    mtDNA_number_data,
+    selected_stats,
+    n_particles = 10000
+)
+
+model_choice_results <- abc_output$results
+abcrf_models <- abc_output$models
+```
+
+```{r}
+#| label: abc-model-choice-performance
+#| cache: true
+
+# Extract error rates from all models
+error_summary <- map_dfr(names(abcrf_models), function(lineage_id) {
+    model <- abcrf_models[[lineage_id]]
+    conf <- model$model.rf$confusion
+
+    # Calculate errors
+    n_drift <- sum(conf["drift", 1:2])
+    n_selection <- sum(conf["selection", 1:2])
+
+    data.frame(
+        lineage = as.integer(lineage_id),
+        oob_error = (conf["drift", "class.error"] * n_drift +
+                     conf["selection", "class.error"] * n_selection) /
+                    (n_drift + n_selection),
+        drift_error = conf["drift", "class.error"],
+        selection_error = conf["selection", "class.error"],
+        n_drift = n_drift,
+        n_selection = n_selection
+    )
+})
+
+# Calculate summary statistics
+error_stats <- error_summary %>%
+    summarize(
+        mean_oob = mean(oob_error, na.rm = TRUE),
+        sd_oob = sd(oob_error, na.rm = TRUE),
+        min_oob = min(oob_error, na.rm = TRUE),
+        max_oob = max(oob_error, na.rm = TRUE),
+        mean_drift_error = mean(drift_error, na.rm = TRUE),
+        mean_selection_error = mean(selection_error, na.rm = TRUE)
+    )
+
+# Add error metrics to model choice results
+model_choice_results <- model_choice_results %>%
+    left_join(error_summary, by = "lineage")
+```
+
+```{r}
+#| label: fig-model-choice-OOB-errors
+#| fig-cap: "ABC-RF classification performance across lineages. Black line and points show out-of-bag (OOB) error rates for each lineage-specific random forest classifier. Red and blue points indicate model-specific misclassification rates for drift and selection models, respectively."
+
+# Plot classification errors by lineage
+p_abc_oob_errors <- ggplot(error_summary, aes(x = lineage)) +
+    geom_line(aes(y = oob_error * 100, color = "OOB"), linewidth = 1) +
+    geom_point(aes(y = oob_error * 100, color = "OOB"), size = 2) +
+    geom_point(aes(y = drift_error * 100, color = "Drift"), size = 2, alpha = 0.6) +
+    geom_point(aes(y = selection_error * 100, color = "Selection"), size = 2, alpha = 0.6) +
+    scale_color_manual(values = c("OOB" = "black", "Drift" = "#E64B35", "Selection" = "#4DBBD5")) +
+    labs(
+        x = "Lineage",
+        y = "Classification Error (%)",
+        color = "Error Type"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "top")
+
+ggsave(here(plot_dir, "abc_rf_classification_errors.png"), p_abc_oob_errors, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "abc_rf_classification_errors.pdf"), p_abc_oob_errors, width = 8, height = 6)
+
+p_abc_oob_errors
+```
+
+The ABC-RF classifiers demonstrated discriminatory power between drift and selection models, achieving a mean out-of-bag (OOB) error of `r sprintf("%.1f%%", error_stats$mean_oob * 100)` (SD: `r sprintf("%.1f%%", error_stats$sd_oob * 100)`, range: `r sprintf("%.1f%%", error_stats$min_oob * 100)`-`r sprintf("%.1f%%", error_stats$max_oob * 100)`) across all lineages. Class-specific misclassification rates were asymmetric, with `r sprintf("%.1f%%", error_stats$mean_drift_error * 100)` for drift versus `r sprintf("%.1f%%", error_stats$mean_selection_error * 100)` for selection. The classifier more often misclassifies selection as drift than vice versa, minimizing false positives.
+
+```{r}
+#| label: fig-abc-model-selection
+#| fig-cap: "Posterior probabilities for selection vs. drift models across all lineages. Stacked bars show the relative support for selection + bottleneck (blue) versus pure drift (red) models. All 14 lineages favor the selection model, with 13/14 showing P(Selection) > 0.9, indicating strong evidence for selection against mutant mtDNA during NSC division."
+
+plot_model_selection <- function(model_choice_results) {
+
+    model_choice_clean <- model_choice_results %>%
+        filter(!is.na(prob_selection)) %>%
+        arrange(desc(prob_selection)) %>%
+        mutate(lineage = factor(
+            lineage,
+            levels = sort(unique(lineage))))
+
+    model_choice_long <- model_choice_clean %>%
+        select(lineage, prob_drift, prob_selection) %>%
+        pivot_longer(
+            cols = c(prob_drift, prob_selection),
+            names_to = "model",
+            values_to = "probability"
+        ) %>%
+        mutate(
+            model = factor(
+                model,
+                levels = c("prob_drift", "prob_selection"),
+                labels = c("Drift", "Selection")
+            )
+        )
+
+    ggplot(
+        model_choice_long,
+        aes(x = lineage, y = probability, fill = model)) +
+        geom_col(width = 0.7) +
+        scale_fill_manual(
+            values = c(
+                "Drift" = "#8491B4B2",
+                "Selection" = "#E64B35B2"),
+            name = "Model"
+        ) +
+        scale_y_continuous(
+            labels = scales::percent,
+            expand = c(0, 0)
+        ) +
+        labs(
+            x = "Lineage",
+            y = "Posterior Probability") +
+        theme_minimal() +
+        theme(
+            legend.position = "top",
+            axis.text.x = element_text(size = 11),
+            panel.grid.major.x = element_blank()
+        )
+}
+
+p_model_selection <- plot_model_selection(model_choice_results)
+
+# Summary of results
+prob_range <- range(model_choice_results$prob_selection, na.rm = TRUE)
+n_strong <- sum(model_choice_results$prob_selection > 0.9, na.rm = TRUE)
+n_total <- sum(!is.na(model_choice_results$prob_selection))
+
+ggsave(here(plot_dir, "abc_model_selection_posterior_probabilities.png"), p_model_selection, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "abc_model_selection_posterior_probabilities.pdf"), p_model_selection, width = 8, height = 6)
+
+p_model_selection
+```
+
+All lineages showed stronger support for the selection + bottleneck model compared to pure drift, with posterior probabilities for selection ranging from `r round(prob_range[1], 3)` to `r round(prob_range[2], 3)`, and `r n_strong` out of `r n_total` lineages exceeding 0.9. This result is particularly robust given the classifier's conservative tendency to misclassify selection as drift, indicating that the selection signal in the data is sufficiently strong to overcome this bias.
+
+
+#### ABC Parameter Estimation using SMC-ABC
+
+We estimated selection coefficients using Sequential Monte Carlo ABC [@lenormand2013], an adaptive algorithm that iteratively refines posterior distributions through sequential resampling. We specified a uniform prior, $s \sim \mathcal{U}(-1, 0.1)$, for the selection coefficient. This prior range allows for strong purifying selection ($s = -1$) to weak positive selection ($s = +0.1$), with the asymmetry reflecting the observed reduction in heteroplasmy from NSCs to progeny cells. We used 1,500 particles per lineage with acceptance threshold declining adaptively from 50% to 2%. For each proposed $s$, we simulated progeny heteroplasmy using observed NSC mtDNA counts and calculated the five selected summary statistics.
+
+```{r}
+#| label: abc-parameter-estimation
+#| echo: true
+#| cache: true
+#| code-summary: "SMC-ABC parameter estimation for selection coefficient (s)"
+
+# SMC-ABC parameter estimation (for individual lineages)
+abc_parameter_estimation <- function(
+    lineage_data,
+    stats_list,
+    n_particles = 1500) {
+
+        # Extract NSC and progeny data
+        progeny_het <- lineage_data$heteroplasmy[lineage_data$cell_type == "Progeny"]
+        nsc_het <- lineage_data$heteroplasmy[lineage_data$cell_type == "NSC"]
+        nsc_wt <- lineage_data$mtDNA_wt[lineage_data$cell_type == "NSC"]
+        nsc_mut <- lineage_data$mtDNA_mut[lineage_data$cell_type == "NSC"]
+        nsc_cn <- lineage_data$mtDNA_total[lineage_data$cell_type == "NSC"]
+        progeny_cn <- lineage_data$mtDNA_total[lineage_data$cell_type == "Progeny"]
+
+        # Simulation function for SMC-ABC
+        simulate_progeny <- function(params)  {
+            s <- params[1]
+
+            sim_het <- simulate_selection(
+                nsc_wt = nsc_wt,
+                nsc_mut = nsc_mut,
+                observed_totals = progeny_cn,
+                s = s
+            )
+
+            calc_summary_stats(
+                progeny_het = sim_het,
+                nsc_het = nsc_het,
+                nsc_cn = nsc_cn,
+                progeny_cn = progeny_cn,
+                stats_list = stats_list
+            )
+        }
+
+        # Define prior distributions
+        prior_list <- list(
+                c("unif", -1, 0.1)  # Prior for s
+            )
+
+        # Calculate target statistics
+        target_stats <- calc_summary_stats(
+            progeny_het = progeny_het,
+            nsc_het = nsc_het,
+            nsc_cn = nsc_cn,
+            progeny_cn = progeny_cn,
+            stats_list = stats_list
+        )
+
+        # Run SMC-ABC
+        smc_result <- try(EasyABC::ABC_sequential(
+            method = "Lenormand",
+            model = simulate_progeny,
+            prior = prior_list,
+            summary_stat_target = target_stats,
+            nb_simul = n_particles,
+            p_acc_min = 0.02,
+            alpha = 0.5,
+            verbose = FALSE
+        ), silent = TRUE)
+
+        if (inherits(smc_result, "try-error")) {
+            warning("SMC-ABC failed for lineage ", unique(lineage_data$lineage))
+            return(NULL)
+        }
+
+        return(as.data.frame(smc_result$param))
+}
+
+# Run SMC-ABC on all lineages
+run_smc_abc_all_lineages <- function(
+    mtDNA_data,
+    stats_list,
+    n_particles = 1500) {
+
+    all_lineages <- unique(mtDNA_data$lineage)
+    all_posteriors <- list()
+
+    results <- map_dfr(all_lineages, function(lineage_num) {
+        lineage_data <- filter(mtDNA_data, lineage == lineage_num)
+
+        progeny_het <- lineage_data$heteroplasmy[lineage_data$cell_type == "Progeny"]
+        nsc_het <- lineage_data$heteroplasmy[lineage_data$cell_type == "NSC"]
+        nsc_cn <- lineage_data$mtDNA_total[lineage_data$cell_type == "NSC"]
+        progeny_cn <- lineage_data$mtDNA_total[lineage_data$cell_type == "Progeny"]
+
+        # Calculate target statistics
+        target_stats <- calc_summary_stats(
+            progeny_het = progeny_het,
+            nsc_het = nsc_het,
+            nsc_cn = nsc_cn,
+            progeny_cn = progeny_cn,
+            stats_list = stats_list
+        )
+
+        # Check data quality
+        if (any(is.na(target_stats)) || length(progeny_het) < 3) {
+            all_posteriors[[as.character(lineage_num)]] <<- NULL
+
+            return(data.frame(
+                lineage = lineage_num,
+                s_median = NA,
+                s_ci_lower = NA,
+                s_ci_upper = NA,
+                success = FALSE
+            ))
+        }
+
+        # Run SMC-ABC
+        posterior <- abc_parameter_estimation(
+            lineage_data,
+            stats_list,
+            n_particles
+        )
+
+        # Store posterior samples and return results
+        if (!is.null(posterior) && nrow(posterior) > 0) {
+            all_posteriors[[as.character(lineage_num)]] <<- posterior
+
+            data.frame(
+                lineage = lineage_num,
+                s_median = median(posterior$V1),
+                s_ci_lower = quantile(posterior$V1, 0.025),
+                s_ci_upper = quantile(posterior$V1, 0.975),
+                n_posterior = nrow(posterior),
+                success = TRUE
+            )
+        } else {
+            all_posteriors[[as.character(lineage_num)]] <<- NULL
+
+            data.frame(
+                lineage = lineage_num,
+                s_median = NA,
+                s_ci_lower = NA,
+                s_ci_upper = NA,
+                n_posterior = NA,
+                success = FALSE
+            )
+        }
+    })
+
+    # Return both results and posteriors
+    return(list(
+        results = results,
+        posteriors = all_posteriors
+    ))
+}
+
+smc_abc_results <- run_smc_abc_all_lineages(
+    mtDNA_number_data,
+    selected_stats,
+    n_particles = 1500
+)
+
+# Add additional metrics
+smc_abc_results$results <- smc_abc_results$results %>%
+    mutate(
+        s_ci_width = s_ci_upper - s_ci_lower,
+        significant_selection = s_ci_upper < 0 | s_ci_lower > 0,
+        selection_strength = case_when(
+            !success ~ "Failed",
+            is.na(s_median) ~ "Failed",
+            s_median > -0.1 ~ "Weak/None",
+            s_median > -0.3 ~ "Moderate",
+            s_median > -0.6 ~ "Strong",
+            TRUE ~ "Very Strong"
+        )
+    )
+```
+
+
+```{r}
+#| label: fig-parameter-estimation-forest
+#| fig-cap: "Selection coefficient estimates for all lineages from Sequential Monte Carlo ABC. Points show posterior median estimates with 95% credible intervals (horizontal bars). All lineages show negative selection coefficients (s < 0), indicating purifying selection against mutant mtDNA. The red dashed line at s = 0 represents neutral evolution."
+
+# Forest plot
+plot_forest <- function(smc_results) {
+    successful <- smc_results$results %>% filter(success)
+
+    ggplot(successful, aes(x = s_median, y = factor(lineage))) +
+        geom_point(size = 3, color = "#2E4BC6") +
+        geom_errorbarh(
+            aes(xmin = s_ci_lower, xmax = s_ci_upper),
+            height = 0.3, color = "#2E4BC6"
+        ) +
+        geom_vline(xintercept = 0, linetype = "dashed", color = "#dc2626") +
+        labs(
+            x = "Selection Coefficient (s)",
+            y = "Lineage"
+        ) +
+        theme_minimal() +
+        theme(
+            axis.text = element_text(size = 11),
+            axis.title = element_text(size = 12, face = "bold")
+        )
+}
+
+p_forest <- plot_forest(smc_abc_results)
+
+ggsave(here(plot_dir, "abc_selection_coefficient_forest_plot.png"), p_forest, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "abc_selection_coefficient_forest_plot.pdf"), p_forest, width = 8, height = 6)
+
+p_forest
+```
+
+```{r}
+#| label: fig-parameter-estimation-ridge
+#| fig-cap: "Posterior distributions of selection coefficients (s) for all lineages. Ridge plots show the full posterior density from SMC-ABC, colored by log₁₀(Bayes Factor) from model selection analysis. Darker colors indicate stronger evidence for selection over drift. All distributions are centered below s = 0 (red dashed line), confirming purifying selection against mutant mtDNA."
+
+# Ridge plot with posteriors
+plot_posteriors_ridge <- function(smc_results, model_choice_results) {
+    # Combine posterior data
+    posterior_data <- map_dfr(names(smc_results$posteriors), function(lineage_id) {
+        posterior <- smc_results$posteriors[[lineage_id]]
+
+        if (!is.null(posterior)) {
+            evidence_row <- model_choice_results %>%
+                filter(lineage == as.numeric(lineage_id))
+
+            data.frame(
+                lineage = as.numeric(lineage_id),
+                s = posterior$V1,
+                log_bf = if(nrow(evidence_row) > 0) evidence_row$log_bf[1] else NA
+            )
+        } else {
+            NULL
+        }
+    })
+
+    ggplot(posterior_data, aes(x = s, y = factor(lineage), fill = log_bf)) +
+        geom_density_ridges(alpha = 0.7, scale = 0.9) +
+        geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+        scale_fill_gradient(
+            low = "#f0f9ff", high = "#1e40af",
+            name = "log(BF)", na.value = "gray50"
+        ) +
+        labs(
+            x = "Selection Coefficient (s)",
+            y = "Lineage"
+        ) +
+        theme_minimal() +
+        theme(
+            legend.position = "right",
+            axis.text = element_text(size = 11)
+        )
+}
+
+p_ridge <- plot_posteriors_ridge(smc_abc_results, model_choice_results)
+
+ggsave(here(plot_dir, "abc_selection_coefficient_ridge_plot.png"), p_ridge, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "abc_selection_coefficient_ridge_plot.pdf"), p_ridge, width = 8, height = 6)
+
+p_ridge
+
+```
+
+```{r}
+#| label: selection-coefficient-summary-table
+
+# Calculate selection coefficient summary statistics
+s_summary <- smc_abc_results$results %>%
+    filter(success) %>%
+    summarize(
+        median_s = median(s_median, na.rm = TRUE),
+        mean_s = mean(s_median, na.rm = TRUE),
+        sd_s = sd(s_median, na.rm = TRUE),
+        min_s = min(s_median, na.rm = TRUE),
+        max_s = max(s_median, na.rm = TRUE),
+        q25_s = quantile(s_median, 0.25, na.rm = TRUE),
+        q75_s = quantile(s_median, 0.75, na.rm = TRUE),
+        n_lineages = n(),
+        n_significant = sum(significant_selection, na.rm = TRUE)
+    )
+
+# Create summary table
+selection_summary_table <- data.frame(
+    Statistic = c(
+        "Number of lineages analyzed",
+        "Lineages with significant selection",
+        "Median selection coefficient",
+        "Mean selection coefficient (± SD)",
+        "Range",
+        "Interquartile range (Q25 - Q75)"
+    ),
+    Value = c(
+        sprintf("%d", s_summary$n_lineages),
+        sprintf("%d (%.1f%%)", s_summary$n_significant,
+                100 * s_summary$n_significant / s_summary$n_lineages),
+        sprintf("%.3f", s_summary$median_s),
+        sprintf("%.3f ± %.3f", s_summary$mean_s, s_summary$sd_s),
+        sprintf("%.3f to %.3f", s_summary$min_s, s_summary$max_s),
+        sprintf("%.3f to %.3f", s_summary$q25_s, s_summary$q75_s)
+    )
+)
+
+knitr::kable(
+    selection_summary_table,
+    col.names = c("", ""),
+    align = c("l", "r"),
+    caption = "Summary statistics for estimated selection coefficients across all lineages"
+) %>%
+    kable_styling(
+        bootstrap_options = c("striped", "hover"),
+        full_width = FALSE
+    )
+```
+
+The median selection coefficient across all lineages was `r round(s_summary$median_s, 3)`, with `r s_summary$n_significant` out of `r s_summary$n_lineages` lineages showing significant evidence for negative selection (95% credible interval excluding zero).
+
+```{r}
+#| label: abc-parameter-recovery
+#| echo: true
+#| cache: true
+#| code-summary: "Parameter recovery validation for SMC-ABC"
+
+# Parameter recovery validation
+abc_parameter_recovery <- function(mtDNA_data, stats_list, n_tests = 20) {
+
+    # Test across range of selection strengths
+    true_s_values <- seq(-0.8, -0.2, length.out = n_tests)
+
+    # Use representative lineage as template
+    template_lineage <- mtDNA_data %>% filter(lineage == 1)
+    template_nsc <- template_lineage %>% filter(cell_type == "NSC")
+    template_progeny <- template_lineage %>% filter(cell_type == "Progeny")
+
+    recovery_results <- map_dfr(true_s_values, function(s_true) {
+
+        # Simulate data with known s
+        sim_progeny_het <- simulate_selection(
+            nsc_wt = template_nsc$mtDNA_wt,
+            nsc_mut = template_nsc$mtDNA_mut,
+            observed_totals = template_progeny$mtDNA_total,
+            s = s_true
+        )
+
+        # Create fake lineage with simulated data
+        fake_lineage <- template_lineage
+        fake_lineage$lineage <- 999
+        fake_lineage$heteroplasmy[fake_lineage$cell_type == "Progeny"] <- sim_progeny_het
+
+        # Estimate s using SMC-ABC
+        result <- tryCatch({
+            abc_parameter_estimation(
+                lineage_data = fake_lineage,
+                stats_list = stats_list,
+                n_particles = 1000
+            )
+        }, error = function(e) NULL)
+
+        if (!is.null(result) && nrow(result) > 0) {
+            s_median <- median(result$V1)
+            s_ci_lower <- quantile(result$V1, 0.025)
+            s_ci_upper <- quantile(result$V1, 0.975)
+
+            data.frame(
+                s_true = s_true,
+                s_estimated = s_median,
+                s_ci_lower = s_ci_lower,
+                s_ci_upper = s_ci_upper,
+                in_ci = (s_true >= s_ci_lower & s_true <= s_ci_upper),
+                bias = s_median - s_true,
+                abs_error = abs(s_median - s_true)
+            )
+        } else {
+            data.frame(
+                s_true = s_true,
+                s_estimated = NA,
+                s_ci_lower = NA,
+                s_ci_upper = NA,
+                in_ci = NA,
+                bias = NA,
+                abs_error = NA
+            )
+        }
+    })
+
+    return(recovery_results)
+}
+
+# Run parameter recovery
+recovery_results <- abc_parameter_recovery(
+    mtDNA_data = mtDNA_number_data,
+    stats_list = selected_stats,
+    n_tests = 20
+)
+
+# Calculate summary statistics
+recovery_summary <- recovery_results %>%
+    filter(!is.na(s_estimated)) %>%
+    summarize(
+        n_tests = n(),
+        coverage = mean(in_ci, na.rm = TRUE) * 100,
+        mean_bias = mean(bias, na.rm = TRUE),
+        mean_abs_error = mean(abs_error, na.rm = TRUE),
+        rmse = sqrt(mean(bias^2, na.rm = TRUE))
+    )
+```
+
+```{r}
+#| label: fig-parameter-recovery
+#| fig-cap: "Parameter recovery validation for SMC-ABC. Points show estimated selection coefficients with 95% credible intervals (error bars) versus true values used in simulations. The dashed diagonal line indicates perfect recovery."
+
+p_recovery <- ggplot(recovery_results, aes(x = s_true, y = s_estimated)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+    geom_point(size = 2.5, color = "#3C5488B2", alpha = 0.7) +
+    geom_errorbar(
+        aes(ymin = s_ci_lower, ymax = s_ci_upper),
+        width = 0.015,
+        color = "#3C5488B2",
+        alpha = 0.5
+    ) +
+    labs(
+        x = "True Selection Coefficient",
+        y = "Estimated Selection Coefficient"
+    ) +
+    theme_minimal() +
+    theme(
+        panel.grid.minor = element_blank(),
+        axis.text = element_text(size = 10)
+    )
+
+ggsave(here(plot_dir, "abc_parameter_recovery.png"),
+       p_recovery, width = 8, height = 6, dpi = 300)
+ggsave(here(plot_dir, "abc_parameter_recovery.pdf"),
+       p_recovery, width = 8, height = 6)
+
+p_recovery
+```
+
+Parameter recovery analysis across `r recovery_summary$n_tests` simulated datasets demonstrated that SMC-ABC reliably estimates selection coefficients. The method achieved `r sprintf("%.0f%%", recovery_summary$coverage)` coverage (close to the nominal 95%), with mean absolute error of `r sprintf("%.3f", recovery_summary$mean_abs_error)` and RMSE of `r sprintf("%.3f", recovery_summary$rmse)`. Estimates showed no systematic bias (mean bias: `r sprintf("%.3f", recovery_summary$mean_bias)`), with points distributed evenly around the line of perfect recovery. The test range (s = -0.8 to -0.2) encompasses all posterior estimates observed across lineages (mean: -0.502 ± 0.099, range: -0.637 to -0.320) with conservative buffers extending 25-37% beyond the most extreme estimates. Parameter uncertainty increased slightly at stronger selection strengths (s < -0.6), reflecting the greater challenge of precisely estimating extreme parameter values. These metrics validate the reliability of our parameter estimation procedure for inferring selection coefficients from experimental data with similar characteristics to our observations.
+
+### Software and Statistical Analysis
+
+All analyses were performed in R version `r getRversion()` [@R-base]. Data manipulation
+used `dplyr` and `tidyr` [@tidyverse], visualization used `ggplot2` [@ggplot2], mixed-effects
+models were fit with `nlme` [@pinheiro2000], and ABC analyses used `EasyABC` [@easyabc] and
+`abcrf` [@raynal2019; @pudlo2016]. Complete package versions are listed in Session Information.
+
+Statistical tests were two-sided unless otherwise stated. Monte Carlo p-values were calculated
+using the formula $(k + 1) / (n + 1)$, where $k$ is the number of simulated values as extreme
+as the observed, and $n$ is the number of simulations.
+
+### References
+
+::: {#refs}
+:::
+
+```{r}
+#| label: session-info
+#| echo: false
+#| output: asis
+
+cat("::: {.callout-note collapse='true'}\n")
+cat("## Session Information\n\n")
+cat("```\n")
+print(sessionInfo())
+cat("\n```\n")
+cat(":::\n")
+```
