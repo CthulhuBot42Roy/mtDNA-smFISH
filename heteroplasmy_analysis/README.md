@@ -4,7 +4,7 @@ Quantitative analysis of mitochondrial DNA heteroplasmy inheritance from NSCs to
 
 ## View Report
 
-The rendered analysis report is available online via [GitHub Pages](https://JvdAlab.github.io/smFISH_heteroplasmy_analysis.html):
+The rendered analysis report is available online via [GitHub Pages](https://jvdalab.github.io/mtDNA-smFISH/smFISH_heteroplasmy_analysis.html):
 
 ## Structure
 
