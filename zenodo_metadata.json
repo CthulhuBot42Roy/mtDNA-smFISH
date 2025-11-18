@@ -1,0 +1,25 @@
+{
+    "title": "mtDNA Nucleoid Colocalization and Spot Quantification (Fiji/ImageJ Macros)",
+    "upload_type": "software",
+    "description": "Fiji/ImageJ macros for quantifying mitochondrial DNA nucleoids, mitochondrial retention, and colocalization of CP, dP, TFAM, and TOMM20 signals in fluorescence microscopy data.",
+    "creators": [
+        {
+            "name": "Roy Chowdhury, R."
+        },
+        {
+            "name": "Additional authors may be added"
+        }
+    ],
+    "keywords": [
+        "mitochondria",
+        "mtDNA",
+        "nucleoids",
+        "TFAM",
+        "ImageJ",
+        "Fiji",
+        "colocalization",
+        "fluorescence microscopy"
+    ],
+    "license": "to be specified",
+    "notes": "Update authors, license, and citation before Zenodo registration."
+}
